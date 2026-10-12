@@ -1,0 +1,24 @@
+{
+  "name": "mortgage-monopoly",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build && node scripts/build-sw.js",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test": "node --test test/*.test.js",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource/vazirmatn": "5.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "fake-indexeddb": "6.2.5",
+    "vite": "8.3.4"
+  }
+}

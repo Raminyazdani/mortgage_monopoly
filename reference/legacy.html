@@ -1,0 +1,288 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>دفتر مورگیج مونوپولی</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;600;800&display=swap">
+<style>
+/* Layout: one add-a-card form on top, then eight seats in turn order; each seat lists its mortgaged cards. */
+:root{
+  --bg:#CFE6D2; --paper:#FDFEFB; --sunk:#EDF4ED; --ink:#16211B; --ink2:#44554B; --line:#B4CBB8;
+  --btn:#16211B; --btn-ink:#FDFEFB; --focus:#1957C2;
+  --warn-bg:#FFF0C7; --warn:#7A4E00; --crit-bg:#FFE0DA; --crit:#A51B10; --auc-bg:#EAE3FF; --auc:#482C9C; --ok:#17663C;
+  --g1:#8E5B3D; --g2:#A9DDF2; --g3:#C4327C; --g4:#F28C28; --g5:#D8352A; --g6:#F4D03F; --g7:#17804A; --g8:#24509E;
+  --font:"Vazirmatn","Segoe UI",Tahoma,"Noto Sans Arabic",system-ui,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0D1611; --paper:#16221B; --sunk:#1D2C23; --ink:#E9F2EB; --ink2:#A6B7AB; --line:#31453A;
+    --btn:#E9F2EB; --btn-ink:#0D1611; --focus:#9CC0FF;
+    --warn-bg:#3B2F12; --warn:#F5C869; --crit-bg:#47170F; --crit:#FFA193; --auc-bg:#2B2154; --auc:#CDBDFF; --ok:#7FD6A4;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D1611; --paper:#16221B; --sunk:#1D2C23; --ink:#E9F2EB; --ink2:#A6B7AB; --line:#31453A;
+  --btn:#E9F2EB; --btn-ink:#0D1611; --focus:#9CC0FF;
+  --warn-bg:#3B2F12; --warn:#F5C869; --crit-bg:#47170F; --crit:#FFA193; --auc-bg:#2B2154; --auc:#CDBDFF; --ok:#7FD6A4;
+  color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:.9375rem;line-height:1.6}
+h1,p,ul{margin:0;padding:0}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.app{max-inline-size:1320px;margin-inline:auto;padding-inline:16px;padding-block:18px 40px;display:flex;flex-direction:column;gap:14px}
+.top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px}
+h1{font-size:1.6rem;font-weight:800;line-height:1.2;text-wrap:balance}
+.rule{color:var(--ink2);font-size:.875rem;max-inline-size:70ch}
+.tools{display:flex;gap:8px}
+.btn{font:inherit;font-weight:600;min-block-size:44px;padding-inline:14px;border:1.5px solid var(--ink);border-radius:6px;background:var(--paper);color:var(--ink);cursor:pointer}
+.btn:disabled{opacity:.4;cursor:default}
+.btn.pri{background:var(--btn);color:var(--btn-ink)}
+.btn.sm{min-block-size:40px;font-size:.875rem;padding-inline:12px}
+.btn[aria-pressed="true"]{background:var(--btn);color:var(--btn-ink)}
+.mode{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:.875rem}
+.add{background:var(--paper);border:1.5px solid var(--ink);border-radius:6px;padding:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;align-items:end}
+.add label{display:flex;flex-direction:column;gap:2px;font-size:.8125rem;font-weight:600;min-inline-size:0}
+.add input,.add select{font:inherit;font-size:1rem;font-weight:400;min-block-size:44px;padding-inline:10px;border:1.5px solid var(--ink);border-radius:4px;background:var(--paper);color:var(--ink);inline-size:100%}
+.msg{color:var(--crit);font-weight:600;font-size:.875rem}
+.seats{display:grid;grid-template-columns:minmax(0,1fr);gap:12px;align-items:start}
+@media (min-width:720px){.seats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (min-width:1240px){.seats{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.seat{background:var(--paper);border:1.5px solid var(--ink);border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:8px;min-inline-size:0}
+.seat header{display:flex;align-items:center;gap:8px}
+.seat header .btn{flex:none;white-space:nowrap}
+.sw{flex:none;inline-size:18px;block-size:36px;border-radius:3px;border:1px solid var(--ink)}
+.nm{flex:1 1 auto;min-inline-size:0;font:inherit;font-size:1.0625rem;font-weight:800;min-block-size:44px;padding-inline:10px;border:1.5px solid var(--ink);border-radius:4px;background:var(--paper);color:var(--ink)}
+.nm::placeholder{color:var(--ink2);font-weight:400;opacity:1}
+.none{color:var(--ink2);font-size:.875rem;padding-inline:4px}
+.cards{list-style:none;display:flex;flex-direction:column;gap:6px}
+.card{border:1px solid var(--line);border-radius:4px;background:var(--sunk);padding:8px 10px;display:flex;flex-direction:column;gap:4px}
+.card.edge{background:var(--warn-bg);border-color:var(--warn)}
+.card.over{background:var(--crit-bg);border-color:var(--crit)}
+.card.auc{background:var(--auc-bg);border-color:var(--auc)}
+.card.done{flex-direction:row;align-items:center;gap:8px;background:transparent;border-style:dashed;padding-block:4px}
+.card.done b{flex:1 1 auto;min-inline-size:0;overflow-wrap:anywhere}
+.paid{flex:none;color:var(--ok);font-size:.8125rem;font-weight:600}
+.btn.x{flex:none;inline-size:40px;padding-inline:0;font-size:1.25rem;line-height:1}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.row b{font-size:1rem;overflow-wrap:anywhere;min-inline-size:0}
+.amt{flex:none;font-size:1.5rem;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.2}
+.meta{color:var(--ink2);font-size:.8125rem}
+.note{font-size:.875rem;font-weight:600}
+.edge .note{color:var(--warn)} .over .note{color:var(--crit)} .auc .note{color:var(--auc)}
+.acts{display:flex;flex-wrap:wrap;gap:6px;margin-block-start:2px}
+.acts .btn{flex:1 1 auto}
+.mv{flex:1 1 120px;min-inline-size:0;max-inline-size:100%;font:inherit;font-size:1rem;font-weight:600;min-block-size:40px;padding-inline:8px;border:1.5px solid var(--ink);border-radius:6px;background:var(--paper);color:var(--ink)}
+</style>
+
+<div class="app" id="app" dir="rtl" lang="fa">
+  <div class="top">
+    <h1>دفتر مورگیج</h1>
+    <div class="tools">
+      <button type="button" class="btn" id="undo" disabled>برگردون</button>
+      <button type="button" class="btn" id="reset">بازی جدید</button>
+    </div>
+  </div>
+  <p class="rule" id="rule"></p>
+  <div class="mode" role="group" aria-labelledby="modeL">
+    <span id="modeL">۱۰٪ هر دور، مثال با کارت ۲۰۰:</span>
+    <button type="button" class="btn sm" id="mComp" aria-pressed="true">روی هم: ۱۱۰، ۱۲۱، ۱۳۳</button>
+    <button type="button" class="btn sm" id="mFlat" aria-pressed="false">ثابت: ۱۱۰، ۱۲۰، ۱۳۰</button>
+  </div>
+
+  <form class="add" id="add" novalidate>
+    <label for="who">کارت مالِ کیه؟<select id="who"></select></label>
+    <label for="cname">اسم کارت<input id="cname" type="text" maxlength="40" autocomplete="off" placeholder="اسم خیابان"></label>
+    <label for="cprice">قیمت کارت<input id="cprice" type="text" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="مثلاً ۲۰۰"></label>
+    <button type="submit" class="btn pri">بذار مورگیج</button>
+  </form>
+  <p class="msg" id="msg" role="alert" hidden></p>
+
+  <div class="seats" id="seats"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  document.documentElement.lang = 'fa';
+  document.documentElement.dir = 'rtl';
+
+  var KEY = 'monopoly-mortgage-v1', FA = '۰۱۲۳۴۵۶۷۸۹', AR = '٠١٢٣٤٥٦٧٨٩';
+  // The loan is half the price. Each lap the bank adds 10%:
+  //   compound (default): 10% of what is owed at that moment -> price/2 * 1.1^n, passes the price on lap 8
+  //   flat:               10% of the original loan            -> price/2 * (1 + n/10), passes the price on lap 11
+  function limit() { return S.compound ? 8 : 11; }
+  // Exact arithmetic, rounded to the nearest whole unit of money (halves go up).
+  function owed(price, laps, compound) {
+    if (typeof BigInt !== 'function') return Math.round((compound ? price / 2 * Math.pow(1.1, laps) : price * (10 + laps) / 20) + 1e-9);
+    var P = BigInt(price), n = BigInt(laps), two = BigInt(2), num, den;
+    if (compound) { num = P * BigInt(11) ** n; den = two * BigInt(10) ** n; }
+    else { num = P * (BigInt(10) + n); den = BigInt(20); }
+    return Number((two * num + den) / (two * den));
+  }
+
+  function fa(n) { return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, '٬').replace(/\d/g, function (d) { return FA[d]; }); }
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function num(v) {
+    var s = String(v || '').replace(/[۰-۹]/g, function (d) { return FA.indexOf(d); }).replace(/[٠-٩]/g, function (d) { return AR.indexOf(d); }).replace(/[\s,٬،]/g, '');
+    return /^\d{1,10}$/.test(s) ? parseInt(s, 10) : NaN;
+  }
+  function debt(c) { return owed(c.price, Math.min(c.laps, limit()), S.compound); }
+  function loan(c) { return Math.round(c.price / 2); }
+  function bid(c) { return Math.round(c.price / 4); }
+
+  function seatName(p) { return 'بازیکن ' + fa(p + 1); }
+  function fresh() { return { players: ['', '', '', '', '', '', '', ''], cards: [], seq: 0, compound: true }; }
+  var S = fresh(), undo = [];
+  try {
+    var saved = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (saved && Array.isArray(saved.players) && saved.players.length === 8 && Array.isArray(saved.cards)) {
+      S = saved;
+      if (typeof S.compound !== 'boolean') S.compound = true;
+      // names left at the old placeholder text become empty, so the field is ready to type into
+      S.players = S.players.map(function (n, p) { n = typeof n === 'string' ? n : ''; return n === seatName(p) ? '' : n; });
+    }
+  } catch (e) {}
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
+  function snap() { undo.push(JSON.stringify(S)); if (undo.length > 50) undo.shift(); }
+
+  var $ = function (id) { return document.getElementById(id); };
+  var seats = $('seats'), who = $('who'), msg = $('msg');
+
+  // A picker on each mortgaged card that hands it, debt and laps included, to another player.
+  function moveHTML(c) {
+    var o = '<option value="">انتقال به…</option>';
+    for (var i = 0; i < 8; i++) if (i !== c.p) o += '<option value="' + i + '">' + esc(S.players[i] || seatName(i)) + '</option>';
+    return '<select class="mv" id="mv-' + esc(c.id) + '" data-id="' + esc(c.id) + '" aria-label="انتقال ' + esc(c.name) + ' به بازیکن دیگه">' + o + '</select>';
+  }
+  function cardHTML(c) {
+    var d = debt(c), id = esc(c.id), head = '<div class="row"><b><bdi>' + esc(c.name) + '</bdi></b><span class="amt">';
+    if (c.paid != null) {
+      return '<li class="card done"><b><bdi>' + esc(c.name) + '</bdi></b><span class="paid">تسویه شد · ' + fa(c.paid) + ' داد</span>' +
+        '<button type="button" class="btn sm x" data-a="close" data-id="' + id + '" aria-label="برداشتن ' + esc(c.name) + ' از لیست">×</button></li>';
+    }
+    if (c.auction) {
+      return '<li class="card auc">' + head + fa(bid(c)) + '</span></div>' +
+        '<p class="note">مزایده از ' + fa(bid(c)) + ' شروع می‌شه (قیمت کارت ' + fa(c.price) + ').</p>' +
+        '<div class="acts"><button type="button" class="btn sm" data-a="close" data-id="' + id + '">مزایده تموم شد</button></div></li>';
+    }
+    var L = limit(), n = Math.min(c.laps, L);
+    var meta = '<p class="meta">قیمت ' + fa(c.price) + ' · گرفته ' + fa(loan(c)) + ' · ' + (n ? 'دور ' + fa(n) : 'هنوز دوری نزده') + '</p>';
+    if (n >= L) {
+      return '<li class="card over">' + head + fa(d) + '</span></div>' + meta +
+        '<p class="note">آخرین شانس: همین الان ' + fa(d) + ' بده، وگرنه مزایده از ' + fa(bid(c)) + '.</p>' +
+        '<div class="acts"><button type="button" class="btn sm pri" data-a="settle" data-id="' + id + '">تسویه کرد</button>' +
+        '<button type="button" class="btn sm" data-a="auction" data-id="' + id + '">نداد، مزایده</button>' + moveHTML(c) + '</div></li>';
+    }
+    var edge = n === L - 1;
+    return '<li class="card' + (edge ? ' edge' : '') + '">' + head + fa(d) + '</span></div>' + meta +
+      (edge ? '<p class="note">دور بعدی از قیمت کارت رد می‌شه.</p>' : '') +
+      '<div class="acts"><button type="button" class="btn sm" data-a="settle" data-id="' + id + '">تسویه کرد · ' + fa(d) + '</button>' + moveHTML(c) + '</div></li>';
+  }
+
+  function render() {
+    seats.innerHTML = S.players.map(function (name, p) {
+      var all = S.cards.filter(function (c) { return c.p === p; });
+      // cards still in mortgage first, settled ones after them
+      var mine = all.filter(function (c) { return c.paid == null; }).concat(all.filter(function (c) { return c.paid != null; }));
+      var canLap = mine.some(function (c) { return !c.auction && c.paid == null && c.laps < limit(); });
+      return '<section class="seat"><header><i class="sw" style="background:var(--g' + (p + 1) + ')"></i>' +
+        '<input class="nm" id="nm' + p + '" data-p="' + p + '" type="text" maxlength="20" autocomplete="off" placeholder="اسم ' + seatName(p) + '" aria-label="اسم ' + seatName(p) + '" value="' + esc(name) + '">' +
+        '<button type="button" class="btn pri" data-a="lap" data-p="' + p + '"' + (canLap ? '' : ' disabled') + '>دور زد</button></header>' +
+        (mine.length ? '<ul class="cards">' + mine.map(cardHTML).join('') + '</ul>' : '<p class="none">کارتی در مورگیج نداره</p>') +
+        '</section>';
+    }).join('');
+    $('undo').disabled = !undo.length;
+    $('mComp').setAttribute('aria-pressed', S.compound ? 'true' : 'false');
+    $('mFlat').setAttribute('aria-pressed', S.compound ? 'false' : 'true');
+    $('rule').textContent = 'مورگیج = نصف قیمت کارت. ' + (S.compound
+      ? 'هر دور ۱۰ درصدِ بدهیِ همون لحظه میاد روش، یعنی ده‌درصدها روی هم سوار می‌شن. دور هشتم بدهی از قیمت کارت رد می‌شه: '
+      : 'هر دور ۱۰ درصدِ مبلغ اول میاد روش. دور یازدهم بدهی از قیمت کارت رد می‌شه: ') +
+      'یک شانس تسویه، وگرنه مزایده از یک‌چهارم قیمت.';
+  }
+  function fillWho() {
+    var keep = who.value;
+    who.innerHTML = S.players.map(function (n, p) { return '<option value="' + p + '">' + esc(n || seatName(p)) + '</option>'; }).join('');
+    if (keep) who.value = keep;
+  }
+  function done() { save(); render(); }
+  function find(id) { for (var i = 0; i < S.cards.length; i++) if (S.cards[i].id === id) return S.cards[i]; return null; }
+  function drop(c) { S.cards = S.cards.filter(function (x) { return x !== c; }); }
+
+  var lastLap = { p: -1, t: 0 };
+  seats.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-a]');
+    if (!b || b.disabled) return;
+    var a = b.dataset.a;
+    if (a === 'lap') {
+      var p = +b.dataset.p, now = Date.now();
+      if (lastLap.p === p && now - lastLap.t < 600) return;   // ignore an accidental double tap
+      lastLap = { p: p, t: now };
+      snap();
+      S.cards.forEach(function (c) { if (c.p === p && !c.auction && c.paid == null && c.laps < limit()) c.laps += 1; });
+      return done();
+    }
+    var c = find(b.dataset.id);
+    if (!c) return;
+    snap();
+    if (a === 'settle') c.paid = debt(c);          // keep it on the seat as a settled record
+    else if (a === 'close') drop(c);
+    else if (a === 'auction') c.auction = true;
+    done();
+  });
+  // Names: typed straight into the field on each seat and saved on every keystroke.
+  var nameEdit = false;   // true from focusing a name until its first keystroke: one undo step per edit
+  seats.addEventListener('focusin', function (e) {
+    if (e.target.classList.contains('nm')) nameEdit = true;
+  });
+  seats.addEventListener('input', function (e) {
+    if (!e.target.classList.contains('nm')) return;
+    if (nameEdit) { snap(); nameEdit = false; $('undo').disabled = false; }
+    var p = +e.target.dataset.p, v = e.target.value.trim().slice(0, 20);
+    S.players[p] = v;
+    save(); fillWho();
+    var opts = seats.querySelectorAll('.mv option[value="' + p + '"]');   // keep the transfer pickers in step with the new name
+    for (var i = 0; i < opts.length; i++) opts[i].textContent = v || seatName(p);
+  });
+  seats.addEventListener('change', function (e) {
+    if (!e.target.classList.contains('mv') || e.target.value === '') return;
+    var c = find(e.target.dataset.id), to = +e.target.value;
+    if (!c || !(to >= 0 && to < 8) || to === c.p) return;
+    snap(); c.p = to; done();
+  });
+
+  $('add').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var price = num($('cprice').value);
+    if (!(price > 0)) { msg.textContent = 'قیمت کارت رو با عدد بنویس، مثلاً ۲۰۰.'; msg.hidden = false; $('cprice').focus(); return; }
+    msg.hidden = true;
+    snap();
+    S.seq = (S.seq || 0) + 1;
+    S.cards.push({ id: 'c' + Date.now().toString(36) + S.seq, p: +who.value || 0, name: $('cname').value.trim().slice(0, 40) || 'کارت ' + fa(S.seq), price: price, laps: 0, auction: false });
+    $('cname').value = ''; $('cprice').value = '';
+    done();
+  });
+
+  $('undo').addEventListener('click', function () {
+    if (!undo.length) return;
+    S = JSON.parse(undo.pop()); save(); fillWho(); render();
+  });
+
+  var armed = 0, resetBtn = $('reset');
+  resetBtn.addEventListener('click', function () {
+    if (Date.now() < armed) {
+      armed = 0; resetBtn.textContent = 'بازی جدید';
+      snap(); S.cards = []; S.seq = 0; done();
+    } else {
+      armed = Date.now() + 4000; resetBtn.textContent = 'مطمئنی؟ دوباره بزن';
+      setTimeout(function () { if (armed && Date.now() >= armed) { armed = 0; resetBtn.textContent = 'بازی جدید'; } }, 4100);
+    }
+  });
+
+  function setMode(v) { if (S.compound === v) return; snap(); S.compound = v; done(); }
+  $('mComp').addEventListener('click', function () { setMode(true); });
+  $('mFlat').addEventListener('click', function () { setMode(false); });
+
+  fillWho(); render();
+})();
+</script>
+
+</body></html>

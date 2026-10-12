@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#174b39" />
+    <meta name="description" content="دفتر محلی مورگیج مونوپولی برای هشت بازیکن؛ ثبت بدهی، دور، انتقال، تسویه و مزایده." />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>دفتر مورگیج مونوپولی</title>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">م</span><div><span class="eyebrow">مونوپولی · هشت نفر، یک دفتر</span><h1>دفتر مورگیج</h1></div></div>
+        <button id="undo" class="button secondary" disabled>↶ برگردون</button>
+      </header>
+      <section class="intro" aria-label="قانون بازی">
+        <div><strong>نصفِ قیمت را بگیر، دورها را ثبت کن.</strong><p>هر دور کامل، ۱۰٪ روی بدهی همان لحظه. بعد از عبور از قیمت کارت، یک شانس تسویه.</p></div>
+        <span class="rule-badge">۱۰٪<small>بهرهٔ مرکب</small></span>
+      </section>
+      <div class="save-line"><span id="storage-status" role="status">در حال بازکردن دفتر…</span><div><button id="retry-save" class="text-button" hidden>دوباره ذخیره کن</button><button id="reload-latest" class="text-button" hidden>خواندن نسخهٔ آخر</button></div></div>
+      <p id="message" role="status" aria-live="polite" hidden></p>
+      <form id="add" class="add-panel" novalidate>
+        <div class="form-heading"><h2>یک کارت تازه</h2><span>مورگیج = نصف قیمت</span></div>
+        <label for="who">کارت مالِ کیه؟<select id="who" required></select></label>
+        <label for="cname">اسم کارت<input id="cname" maxlength="120" autocomplete="off" placeholder="مثلاً خیابان آزادی" required /></label>
+        <label for="cprice">قیمت اصلی کارت<input id="cprice" inputmode="numeric" maxlength="20" autocomplete="off" placeholder="مثلاً ۲۰۰" aria-describedby="price-hint" required /></label>
+        <button type="submit" class="button primary">بذار مورگیج</button>
+        <small id="price-hint">عدد صحیح از ۱ تا ۹٬۹۹۹٬۹۹۹٬۹۹۹ · ارقام فارسی، عربی و لاتین پذیرفته می‌شوند.</small>
+      </form>
+      <div class="section-heading"><h2>دورِ میز</h2><span id="summary">۸ جایگاه بازیکن</span></div>
+      <main id="seats" class="seats" aria-label="بازیکن‌ها و کارت‌ها"></main>
+      <details class="fold" id="history"><summary>سوابق این بازی <span id="history-count"></span></summary><div id="history-list" class="history-list"></div></details>
+      <section class="bottom-panel" aria-label="پشتیبان و بازی جدید">
+        <div><h2>دفترت را همراه ببر</h2><p>روی همین مرورگر ذخیره می‌شود. برای انتقال یا پشتیبان، خروجی بگیر.</p></div>
+        <div class="tools"><button id="export" class="button secondary">خروجی JSON</button><label class="button secondary file-label">بازیابی JSON<input id="import-file" type="file" accept=".json,application/json" /></label><button id="reset" class="button secondary">بازی جدید</button></div>
+      </section>
+      <details class="fold" id="archives"><summary>بازی‌های بایگانی‌شده <span id="archive-count"></span></summary><div id="archive-list" class="history-list"></div></details>
+      <details class="fold guide"><summary>راهنمای کوتاه و قواعد دقیق</summary><div>
+        <p>«دور زد» را فقط وقتی بزن که همان بازیکن یک دور کامل روی صفحهٔ بازی زده؛ هر نوبت بازی یک دور نیست. فقط کارت‌های فعال او بهره می‌گیرند. تا تعیین تکلیف همهٔ کارت‌های «آخرین شانس»، دور تازهٔ آن بازیکن ثبت نمی‌شود.</p>
+        <p>بهره روی مقدار دقیق انباشته حساب می‌شود و فقط مبلغ نهایی گرد می‌شود؛ نصف‌ها به بالا. کارت ۲۰۰: ۱۰۰، ۱۱۰، ۱۲۱، ۱۳۳، ۱۴۶، ۱۶۱، ۱۷۷، ۱۹۵ و ۲۱۴. آخرین شانس با عبور دقیق از قیمت شروع می‌شود؛ زمان‌سنج ندارد و بدهی ثابت می‌ماند.</p>
+        <p>قیمت فرد هم از نصف دقیق شروع می‌شود: کارت ۲۰۱، دریافت نمایشی ۱۰۱، دور اول ۱۱۱. مزایده از یک‌چهارم قیمت با همان گردکردن شروع می‌شود؛ ۱۵۰ ← ۳۸، ۲۰۱ ← ۵۰، ۲۰۲ ← ۵۱. انتقال بهره یا کارمزد ندارد. تسویه فقط کامل است.</p>
+        <p>«برگردون» تا ۵۰ اقدام را حتی پس از بستن صفحه برمی‌گرداند. تسویه‌ها و مزایده‌های بسته در سوابق می‌مانند. پیش از بازی جدید یا بازیابی، دفتر فعلی بایگانی می‌شود.</p>
+        <p>هر مرورگر دفتر خودش را دارد. پاک‌کردن دادهٔ سایت یا حالت خصوصی ممکن است دفتر را از بین ببرد. برای جابه‌جایی بین گوشی‌ها یا آدرس‌ها، خروجی و بازیابی JSON را استفاده کن. هنگام استفادهٔ هم‌زمان در دو تب، تغییر ناسازگار متوقف می‌شود؛ نسخهٔ آخر را بخوان.</p>
+        <p id="offline-status">بعد از آماده‌شدن نسخهٔ آفلاین، همین آدرس بدون شبکه هم باز می‌شود.</p>
+        <p id="legacy-notice" hidden></p>
+      </div></details>
+      <footer>یک دفتر برای دورِ هم بازی کردن <span id="build-id"></span></footer>
+    </div>
+    <dialog id="confirm-dialog" aria-labelledby="dialog-title"><h2 id="dialog-title"></h2><p id="dialog-body"></p><div class="tools"><button id="confirm-action" class="button primary">تأیید</button><button id="cancel-action" class="button secondary">انصراف</button></div></dialog>
+    <noscript>برای کار با دفتر، جاوااسکریپت مرورگر باید فعال باشد.</noscript>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
