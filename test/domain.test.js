@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SCHEMA_VERSION, MAX_PRICE, createGame, validateGame, parsePrice, calculate,
-  canLap, applyAction, migrateLegacy,
+  SCHEMA_VERSION, MAX_PRICE, MAX_CARD_HISTORY, createGame, validateGame, parsePrice, calculate,
+  canLap, applyAction, migrateLegacy, hydrateGameHistory,
 } from '../src/domain.js';
 
 const action = (game, type, extra = {}) => applyAction(game, { type, ...extra });
@@ -138,7 +138,8 @@ test('required transfer of debt 121 moves only future lap responsibility', () =>
   let game = lap(add(createGame()), 'p1', 2);
   const before = structuredClone(game.cards[0]);
   game = action(game, 'transfer', { cardId: before.id, ownerId: 'p2' });
-  assert.deepEqual(game.cards[0], { ...before, ownerId: 'p2' });
+  assert.deepEqual({ ...game.cards[0], history: before.history }, { ...before, ownerId: 'p2' });
+  assert.equal(game.cards[0].history.at(-1).type, 'transfer');
   assert.equal(calculate(game.cards[0]).debt, 121);
   assert.equal(lap(game, 'p1'), game);
   game = lap(game, 'p2');
@@ -155,7 +156,8 @@ test('transfer of grace preserves frozen debt and transfers the unresolved-decis
   assert.equal(canLap(game, 'p1'), false);
   assert.equal(canLap(game, 'p2'), true);
   game = action(game, 'transfer', { cardId: before.id, ownerId: 'p2' });
-  assert.deepEqual(game.cards[0], { ...before, ownerId: 'p2' });
+  assert.deepEqual({ ...game.cards[0], history: before.history }, { ...before, ownerId: 'p2' });
+  assert.equal(game.cards[0].history.at(-1).after.debt, 214);
   assert.equal(canLap(game, 'p1'), true);
   assert.equal(canLap(game, 'p2'), false);
   assert.equal(lap(game, 'p2'), game);
@@ -350,4 +352,287 @@ test('calculation rejects hostile bounds before exponentiation', () => {
     assert.throws(() => calculate(card));
   }
   assert.throws(() => calculate({ price: 200, laps: 1 }, 'unknown'));
+});
+
+test('new per-card history records exact event order and immutable owner names', () => {
+  let game = add(createGame(['رامین', 'سارا']));
+  const cardId = game.cards[0].id;
+  const created = structuredClone(game.cards[0].history[0]);
+  assert.equal(created.type, 'created');
+  assert.equal(created.at, game.cards[0].createdAt);
+  assert.equal(created.before, null);
+  assert.deepEqual(created.after, { name: 'خیابان', price: 200, laps: 0, ownerId: 'p1',
+    ownerName: 'رامین', status: 'active', debt: 100, paid: null });
+  game = lap(game, 'p1', 2);
+  game = action(game, 'rename', { ownerId: 'p1', name: 'نام تازه' });
+  game = action(game, 'transfer', { cardId, ownerId: 'p2' });
+  game = action(game, 'rename', { ownerId: 'p2', name: 'سارا تازه' });
+  game = action(game, 'settle', { cardId });
+  const events = game.cards[0].history;
+  assert.deepEqual(events.map((event) => event.type), ['created', 'lap', 'lap', 'transfer', 'settle']);
+  assert.deepEqual(events.map((event) => event.after.debt), [100, 110, 121, 121, 121]);
+  assert.deepEqual(events[0], created);
+  assert.equal(events[1].before.ownerName, 'رامین');
+  assert.equal(events[3].before.ownerName, 'نام تازه');
+  assert.equal(events[3].after.ownerName, 'سارا');
+  assert.equal(events[4].after.ownerName, 'سارا تازه');
+  assert.equal(events[4].after.paid, 121);
+  assert.equal(new Set(events.map((event) => event.id)).size, events.length);
+  assert.ok(events.every((event) => Number.isFinite(Date.parse(event.at))));
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('one lap yields independent card events with the same action timestamp and exact odd-price amounts', () => {
+  const original = add(add(add(createGame(['رامین'])), 'p1', 201, 'دوم'), 'p2', 150, 'دیگری');
+  const next = lap(original);
+  const [first, second, other] = next.cards;
+  assert.equal(first.history.at(-1).after.debt, 110);
+  assert.equal(second.history.at(-1).after.debt, 111);
+  assert.equal(first.history.at(-1).at, second.history.at(-1).at);
+  assert.notEqual(first.history.at(-1).id, second.history.at(-1).id);
+  assert.equal(other.history.length, 1);
+  assert.ok(original.cards.every((card) => card.history.length === 1));
+});
+
+test('old v2 history hydration is immutable and idempotent with only a known-state baseline', () => {
+  const original = lap(add(createGame(['رامین'])), 'p1', 2);
+  delete original.cards[0].history;
+  const before = structuredClone(original);
+  assert.equal(validateGame(original), original);
+  const hydrated = hydrateGameHistory(original);
+  assert.deepEqual(original, before);
+  assert.notEqual(hydrated, original);
+  const [event] = hydrated.cards[0].history;
+  assert.equal(event.type, 'baseline');
+  assert.equal(event.at, null);
+  assert.equal(event.before, null);
+  assert.deepEqual(event.after, { name: 'خیابان', price: 200, laps: 2, ownerId: 'p1',
+    ownerName: 'رامین', status: 'active', debt: 121, paid: null });
+  assert.equal(hydrated.cards[0].history.length, 1);
+  assert.equal(hydrateGameHistory(hydrated), hydrated);
+  const continued = lap(original);
+  assert.deepEqual(continued.cards[0].history.map((item) => item.type), ['baseline', 'lap']);
+  assert.equal(continued.cards[0].history[0].at, null);
+  assert.equal(continued.cards[0].history[1].after.debt, 133);
+});
+
+test('changes carried forward by an old tab add a dated-unknown baseline gap and retain known prior events', () => {
+  const oldTab = lap(add(createGame(['رامین', 'سارا'])), 'p1', 2);
+  const previousEvents = structuredClone(oldTab.cards[0].history);
+  oldTab.cards[0].ownerId = 'p2';
+  oldTab.cards[0].laps = 3;
+  const before = structuredClone(oldTab);
+  assert.throws(() => validateGame(oldTab));
+  assert.equal(validateGame(oldTab, { allowHistoryGap: true }), oldTab);
+  const hydrated = hydrateGameHistory(oldTab);
+  assert.deepEqual(oldTab, before);
+  assert.deepEqual(hydrated.cards[0].history.slice(0, -1), previousEvents);
+  const baseline = hydrated.cards[0].history.at(-1);
+  assert.equal(baseline.type, 'baseline');
+  assert.equal(baseline.at, null);
+  assert.equal(baseline.before, null);
+  assert.equal(baseline.after.ownerId, 'p2');
+  assert.equal(baseline.after.ownerName, 'سارا');
+  assert.equal(baseline.after.laps, 3);
+  assert.equal(baseline.after.debt, 133);
+  assert.equal(hydrateGameHistory(hydrated), hydrated);
+  const continued = lap(hydrated, 'p2');
+  assert.deepEqual(continued.cards[0].history.map((event) => event.type), ['created', 'lap', 'lap', 'baseline', 'lap']);
+  assert.equal(continued.cards[0].history.at(-1).before.debt, 133);
+  assert.equal(continued.cards[0].history.at(-1).after.debt, 146);
+  assert.deepEqual(roundTrip(continued), continued);
+});
+
+test('owner-name drift never fabricates a gap and a corrupt event chain still cannot hydrate', () => {
+  const renamed = add(createGame(['رامین']));
+  renamed.players[0].name = 'نام تازه';
+  assert.equal(hydrateGameHistory(renamed), renamed);
+  assert.equal(renamed.cards[0].history[0].after.ownerName, 'رامین');
+  const corrupted = lap(renamed);
+  corrupted.cards[0].history[1].before.price = 300;
+  const before = JSON.stringify(corrupted);
+  assert.throws(() => hydrateGameHistory(corrupted));
+  assert.equal(JSON.stringify(corrupted), before);
+});
+
+test('legacy migration adds a baseline without inventing past payments or timestamps', () => {
+  const game = migrateLegacy(legacy([legacyCard('paid', { laps: 3, paid: 125 })]));
+  const event = game.cards[0].history[0];
+  assert.equal(event.type, 'baseline');
+  assert.equal(event.at, null);
+  assert.equal(event.before, null);
+  assert.equal(event.after.debt, 133);
+  assert.equal(event.after.paid, 125);
+  assert.equal(game.cards[0].history.length, 1);
+});
+
+test('editing name and price keeps two laps and corrects exact debt 121 to 182', () => {
+  const original = lap(add(createGame(['رامین'])), 'p1', 2);
+  const previous = structuredClone(original);
+  const cardId = original.cards[0].id;
+  const corrected = action(original, 'editCard', { cardId, name: '  خیابان درست  ', price: 300 });
+  assert.deepEqual(original, previous);
+  const card = corrected.cards[0];
+  assert.equal(card.id, cardId);
+  assert.equal(card.ownerId, original.cards[0].ownerId);
+  assert.equal(card.createdAt, original.cards[0].createdAt);
+  assert.equal(card.status, 'active');
+  assert.equal(card.laps, 2);
+  assert.equal(card.name, 'خیابان درست');
+  assert.equal(calculate(card).loan, 150);
+  assert.equal(calculate(card).debt, 182);
+  const event = card.history.at(-1);
+  assert.equal(event.type, 'editCard');
+  assert.equal(event.before.name, 'خیابان');
+  assert.equal(event.before.price, 200);
+  assert.equal(event.before.debt, 121);
+  assert.equal(event.after.name, 'خیابان درست');
+  assert.equal(event.after.price, 300);
+  assert.equal(event.after.debt, 182);
+  assert.equal(event.after.laps, 2);
+  const advanced = lap(corrected);
+  assert.equal(calculate(advanced.cards[0]).debt, 200); // exact 199.65, not 182 * 1.1 = 200.2
+  assert.deepEqual(roundTrip(corrected), corrected);
+});
+
+test('odd-price and legacy-simple corrections keep the original interest model and raw laps', () => {
+  const original = lap(add(createGame()), 'p1', 2);
+  const odd = action(original, 'editCard', { cardId: original.cards[0].id, name: 'خیابان', price: 201 });
+  assert.equal(calculate(odd.cards[0]).loan, 101);
+  assert.equal(calculate(odd.cards[0]).debt, 122);
+  assert.equal(odd.cards[0].laps, 2);
+  const simple = migrateLegacy(legacy([legacyCard('simple', { laps: 10 })], false));
+  const corrected = action(simple, 'editCard', { cardId: 'simple', name: 'اصلاح شده', price: 301 });
+  assert.equal(corrected.model, 'legacy-simple');
+  assert.equal(corrected.cards[0].laps, 10);
+  assert.deepEqual(corrected.cards[0].legacy, { rawLaps: 10 });
+  assert.equal(calculate(corrected.cards[0], corrected.model).debt, 301);
+  assert.equal(corrected.cards[0].status, 'active');
+});
+
+test('correction preserves grace, auction and closed-auction status while recomputing debt and bid', () => {
+  for (const status of ['grace', 'auction', 'auction_closed']) {
+    let game = lap(add(createGame()), 'p1', 8);
+    const cardId = game.cards[0].id;
+    if (status !== 'grace') game = action(game, 'auction', { cardId });
+    if (status === 'auction_closed') game = action(game, 'closeAuction', { cardId });
+    const original = structuredClone(game.cards[0]);
+    const corrected = action(game, 'editCard', { cardId, name: 'درست', price: 302 });
+    const card = corrected.cards[0];
+    assert.equal(card.status, status);
+    assert.equal(card.laps, 8);
+    assert.equal(card.createdAt, original.createdAt);
+    assert.equal(card.closedAt, original.closedAt);
+    assert.equal(calculate(card).debt, 324);
+    assert.equal(calculate(card).bid, 76);
+    assert.equal(card.history.at(-1).before.status, status);
+    assert.equal(card.history.at(-1).after.status, status);
+    assert.deepEqual(roundTrip(corrected), corrected);
+  }
+});
+
+test('editing settled cards preserves the actual settlement amount, time and owner', () => {
+  let game = lap(add(createGame(['رامین'])), 'p1', 2);
+  const cardId = game.cards[0].id;
+  game = action(game, 'transfer', { cardId, ownerId: 'p2' });
+  game = action(game, 'settle', { cardId });
+  const settlement = structuredClone(game.cards[0].settlement);
+  const corrected = action(game, 'editCard', { cardId, name: 'اصلاح بعد از تسویه', price: 300 });
+  const card = corrected.cards[0];
+  assert.equal(card.status, 'settled');
+  assert.equal(card.ownerId, 'p2');
+  assert.equal(card.laps, 2);
+  assert.deepEqual(card.settlement, settlement);
+  assert.equal(calculate(card).debt, 182);
+  assert.equal(card.history.at(-1).before.paid, 121);
+  assert.equal(card.history.at(-1).after.paid, 121);
+  assert.deepEqual(roundTrip(corrected), corrected);
+});
+
+test('undo snapshots restore edited fields and remove the edit event together', () => {
+  let game = lap(add(createGame()), 'p1', 2);
+  const undo = structuredClone(game);
+  game = action(game, 'editCard', { cardId: game.cards[0].id, name: 'اصلاح', price: 300 });
+  assert.equal(game.cards[0].history.at(-1).type, 'editCard');
+  game = undo;
+  assert.equal(game.cards[0].name, 'خیابان');
+  assert.equal(game.cards[0].price, 200);
+  assert.equal(game.cards[0].laps, 2);
+  assert.equal(calculate(game.cards[0]).debt, 121);
+  assert.deepEqual(game.cards[0].history.map((event) => event.type), ['created', 'lap', 'lap']);
+  assert.deepEqual(roundTrip(game), undo);
+});
+
+test('no-op and invalid edits never append history or change their source', () => {
+  const game = add(createGame());
+  const cardId = game.cards[0].id;
+  const before = JSON.stringify(game);
+  assert.equal(action(game, 'editCard', { cardId, name: ' خیابان ', price: 200 }), game);
+  assert.equal(action(game, 'editCard', { cardId: 'absent', name: 'اصلاح', price: 300 }), game);
+  assert.equal(action(game, 'auction', { cardId }), game);
+  assert.equal(action(game, 'transfer', { cardId, ownerId: 'p1' }), game);
+  assert.equal(lap(game, 'p8'), game);
+  for (const name of ['', '   ', null, 'a'.repeat(121)]) {
+    assert.throws(() => action(game, 'editCard', { cardId, name, price: 300 }));
+  }
+  for (const price of [0, -1, 1.5, Infinity, '300', MAX_PRICE + 1]) {
+    assert.throws(() => action(game, 'editCard', { cardId, name: 'اصلاح', price }));
+  }
+  assert.equal(JSON.stringify(game), before);
+  const old = structuredClone(game);
+  delete old.cards[0].history;
+  assert.equal(action(old, 'editCard', { cardId, name: 'خیابان', price: 200 }), old);
+  assert.equal(old.cards[0].history, undefined);
+});
+
+test('hostile event imports reject bad bounds, identities, money and transitions without mutation', () => {
+  const original = lap(add(createGame()), 'p1', 2);
+  const reject = (mutate) => {
+    const candidate = structuredClone(original);
+    mutate(candidate.cards[0]);
+    const before = JSON.stringify(candidate);
+    assert.throws(() => validateGame(candidate));
+    assert.equal(JSON.stringify(candidate), before);
+  };
+  reject((card) => { card.history = null; });
+  reject((card) => { card.history = []; });
+  reject((card) => { card.history[1].id = card.history[0].id; });
+  reject((card) => { card.history[1].type = 'delete'; });
+  reject((card) => { card.history[1].at = '2026-02-31T00:00:00.000Z'; });
+  reject((card) => { card.history[1].at = null; });
+  reject((card) => { card.history[0].before = {}; });
+  reject((card) => { card.history[1].before = null; });
+  reject((card) => { card.history[1].after.laps = 1_000_000; });
+  reject((card) => { card.history[1].after.ownerId = 'p9'; });
+  reject((card) => { card.history[1].after.ownerName = 'x'.repeat(81); });
+  reject((card) => { card.history[1].after.name = 'x'.repeat(121); });
+  reject((card) => { card.history[1].after.price = MAX_PRICE + 1; });
+  reject((card) => { card.history[1].after.debt = 111; });
+  reject((card) => { card.history[1].after.paid = 110; });
+  reject((card) => { card.history[1].type = 'transfer'; });
+  reject((card) => { card.history[1].before.name = 'unrecorded edit'; });
+  reject((card) => { card.history[1].after.status = 'grace'; });
+  reject((card) => { card.name = 'not matching final event'; });
+  reject((card) => { card.history[1].before.debt = MAX_PRICE * 2 + 1; });
+});
+
+test('full history rejects the next action atomically without dropping old events', () => {
+  const original = add(add(createGame()), 'p1', 200, 'full');
+  const full = original.cards[1];
+  for (let index = 1; index < MAX_CARD_HISTORY; index += 1) {
+    const before = structuredClone(full.history.at(-1).after);
+    const after = { ...before, name: `full-${index}` };
+    full.history.push({ id: `edit-${index}`, type: 'editCard', at: full.createdAt, before, after });
+    full.name = after.name;
+  }
+  assert.equal(validateGame(original), original);
+  const before = JSON.stringify(original);
+  assert.throws(() => lap(original), /۵۰۰/);
+  assert.throws(() => action(original, 'editCard', { cardId: full.id, name: 'more', price: 300 }), /۵۰۰/);
+  assert.throws(() => action(original, 'settle', { cardId: full.id }), /۵۰۰/);
+  assert.equal(JSON.stringify(original), before);
+  assert.equal(original.cards[0].laps, 0);
+  const oversized = structuredClone(original);
+  oversized.cards[1].history.push(structuredClone(full.history.at(-1)));
+  assert.throws(() => validateGame(oversized));
 });

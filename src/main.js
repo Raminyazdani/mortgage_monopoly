@@ -8,7 +8,8 @@ const escape = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&
 const clone = value => structuredClone(value);
 const colors=['#926142','#6faec7','#ba528d','#dd913b','#c85843','#b89b34','#498955','#4973ae'];
 let envelope, persistedRevision=0, dirty=false, failure=null, loadFailure=false, financialBusy=false;
-let drainPromise=null, nameSession=null, confirmCallback=null;
+let drainPromise=null, nameSession=null, confirmCallback=null, editingCardId=null;
+let openCardHistories=new Set();
 const lastLap=new Map();
 const store = new LedgerStore({onChange:async event=>{
   if(!envelope||failure||dirty||financialBusy||drainPromise) return;
@@ -41,7 +42,8 @@ function controls(){
   $('export').disabled=!envelope&&!store.readRaw();
   for(const input of document.querySelectorAll('[data-name]'))input.disabled=blocked;
   for(const button of document.querySelectorAll('[data-lap]'))button.disabled=blocked||!!drainPromise||!canLap(envelope.game,button.dataset.lap);
-  for(const node of document.querySelectorAll('[data-action],[data-transfer],[data-restore-game]'))node.disabled=blocked||!!drainPromise;
+  for(const node of document.querySelectorAll('[data-action],[data-transfer],[data-restore-game],[data-edit-card]'))node.disabled=blocked||!!drainPromise;
+  $('edit-save').disabled=blocked||!!drainPromise;
 }
 function setStorage(){
   if(failure){$('storage-status').textContent=loadFailure?'دادهٔ قبلی باز نشد و جایگزین نشده؛ خروجی بازیابی یا فایل سالم را استفاده کن.':'ذخیره نشد؛ تغییر روی صفحه است، نسخهٔ قبلی هنوز محفوظ است.';$('retry-save').hidden=loadFailure;$('reload-latest').hidden=false;}
@@ -81,6 +83,37 @@ async function act(action,label){
   }catch(error){message(error.message,true);return false;}
   finally{financialBusy=false;controls();}
 }
+function historicalOwner(snapshot){
+  const seat=Number(snapshot.ownerId.slice(1));
+  return `${snapshot.ownerName || 'بازیکن'} · جایگاه ${fa(seat)}`;
+}
+function cardEventHTML(event){
+  const before=event.before, after=event.after;
+  const labels={baseline:'وضعیت قبلی کارت',created:'ثبت مورگیج',lap:'دور کامل',transfer:'انتقال کارت',settle:'تسویه',auction:'شروع مزایده',closeAuction:'پایان مزایده',editCard:'اصلاح اسم و قیمت'};
+  let detail='';
+  if(event.type==='baseline')detail=`جزئیات اتفاقات پیش از این نقطه ثبت نشده است. ${historicalOwner(after)} · دور ${fa(after.laps)} · قیمت ${fa(after.price)} · بدهی ${fa(after.debt)}${after.paid!==null?` · پرداخت ثبت‌شده ${fa(after.paid)}`:''}`;
+  if(event.type==='created')detail=`${historicalOwner(after)} · ${after.name} · قیمت ${fa(after.price)} · دریافت ${fa(after.debt)}`;
+  if(event.type==='lap')detail=`${historicalOwner(after)} دور زد · ${fa(before.debt)} ← ${fa(after.debt)} · دور ${fa(after.laps)}${after.status==='grace'?' · آخرین شانس':''}`;
+  if(event.type==='transfer')detail=`از ${historicalOwner(before)} به ${historicalOwner(after)} · بدهی ${fa(after.debt)} · دور ${fa(after.laps)}`;
+  if(event.type==='settle')detail=`${historicalOwner(after)} مبلغ ${fa(after.paid)} داد · ${after.name}`;
+  if(event.type==='auction')detail=`${after.name} · شروع از ${fa(calculate(after,envelope.game.model).bid)} · بدهی ثابت ${fa(after.debt)}`;
+  if(event.type==='closeAuction')detail=`${after.name} · مزایده بسته شد و سابقه باقی ماند.`;
+  if(event.type==='editCard'){
+    const changes=[];
+    if(before.name!==after.name)changes.push(`اسم: «${before.name}» ← «${after.name}»`);
+    if(before.price!==after.price)changes.push(`قیمت: ${fa(before.price)} ← ${fa(after.price)}`);
+    changes.push(`دور ${fa(after.laps)} حفظ شد · بدهی ${fa(before.debt)} ← ${fa(after.debt)}`);
+    if(after.paid!==null)changes.push(`پرداخت ثبت‌شده همان ${fa(after.paid)} باقی ماند.`);
+    detail=changes.join('\n');
+  }
+  const time=event.at?new Intl.DateTimeFormat('fa-IR',{dateStyle:'short',timeStyle:'short'}).format(new Date(event.at)):'زمان اتفاقات قبلی نامشخص';
+  return `<li data-event-type="${escape(event.type)}"><div class="event-heading"><b>${labels[event.type]}</b><small>${escape(time)}</small></div><p>${escape(detail)}</p></li>`;
+}
+function cardHistoryHTML(card){
+  const events=card.history||[];
+  return `<details class="card-history" data-card-history="${escape(card.id)}"${openCardHistories.has(card.id)?' open':''}><summary>تاریخچهٔ کارت <span>(${fa(events.length)})</span></summary><ol data-events="${escape(card.id)}">${events.map(cardEventHTML).join('')}</ol></details>`;
+}
+function editCardButton(card){return `<button type="button" class="text-button edit-card-button" data-edit-card="${escape(card.id)}">اصلاح اسم و قیمت</button>`;}
 function cardHTML(card){
   const amounts=calculate(card,envelope.game.model);
   const status=card.status,warning=status==='active'&&amounts.nextOver;
@@ -95,16 +128,19 @@ function cardHTML(card){
     <p class="meta">قیمت ${fa(card.price)} · گرفته ${fa(amounts.loan)} · دور ${fa(card.laps)}<br>بهرهٔ انباشته ${fa(amounts.interest)}${status==='auction'?` · بدهی ثابت ${fa(amounts.debt)}`:''}</p>
     ${note?`<p class="card-note">${note}</p>`:''}
     <div class="card-actions">${status==='auction'?`<button class="button secondary" data-action="closeAuction" data-id="${escape(card.id)}">مزایده تمام شد</button>`:settle+(status==='grace'?`<button class="button secondary" data-action="auction" data-id="${escape(card.id)}">نداد، مزایده</button>`:'')+transfer}</div>
+    ${editCardButton(card)}${cardHistoryHTML(card)}
   </article>`;
 }
 function historyHTML(card){
   return `<article class="history-card" data-card="${escape(card.id)}" data-status="${card.status}" ${card.settlement?`data-paid="${card.settlement.amount}"`:''}>
     <div><bdi><b>${escape(card.name)}</b></bdi><p>${escape(ownerName(card.settlement?.ownerId||card.ownerId))} · قیمت ${fa(card.price)}</p></div>
     <span>${card.status==='settled'?`تسویه شد · ${fa(card.settlement.amount)} داد`:'مزایده بسته شد'}</span>
+    ${editCardButton(card)}${cardHistoryHTML(card)}
   </article>`;
 }
 function render(){
   if(!envelope)return controls();
+  openCardHistories=new Set(Array.from(document.querySelectorAll('[data-card-history][open]'),node=>node.dataset.cardHistory));
   const game=envelope.game;
   $('seats').innerHTML=game.players.map((player,index)=>{
     const cards=game.cards.filter(c=>c.ownerId===player.id&&['active','grace','auction'].includes(c.status));
@@ -134,6 +170,38 @@ function confirm(title,body,callback,label='تأیید'){
 }
 $('cancel-action').addEventListener('click',()=>{$('confirm-dialog').close();confirmCallback=null;});
 $('confirm-action').addEventListener('click',async()=>{const callback=confirmCallback;confirmCallback=null;$('confirm-dialog').close();if(callback)try{await callback();}catch(error){message(error.message,true);}});
+function editPreview(){
+  const card=envelope?.game.cards.find(c=>c.id===editingCardId);
+  if(!card)return;
+  try{
+    const price=parsePrice($('edit-price').value);
+    const old=calculate(card,envelope.game.model),next=calculate({...card,price},envelope.game.model);
+    $('edit-preview').textContent=`دور ${fa(card.laps)} حفظ می‌شود.\nبدهی: ${fa(old.debt)} ← ${fa(next.debt)}\nدریافت اولیه: ${fa(old.loan)} ← ${fa(next.loan)}${['auction','auction_closed'].includes(card.status)?`\nشروع مزایده: ${fa(old.bid)} ← ${fa(next.bid)}`:''}${card.settlement?`\nمبلغ تسویهٔ ثبت‌شده ${fa(card.settlement.amount)} ثابت می‌ماند.`:''}\nاصلاح با «برگردون» قابل برگشت است.`;
+    $('edit-error').hidden=true;
+  }catch(error){$('edit-preview').textContent=error.message;}
+}
+document.addEventListener('click',event=>{
+  const button=event.target.closest('[data-edit-card]');
+  if(!button||button.disabled||financialBusy||failure||!envelope)return;
+  const card=envelope.game.cards.find(c=>c.id===button.dataset.editCard);
+  if(!card)return;
+  editingCardId=card.id;$('edit-name').value=card.name;$('edit-price').value=String(card.price);$('edit-error').hidden=true;editPreview();$('edit-dialog').showModal();
+});
+$('edit-price').addEventListener('input',editPreview);
+$('edit-name').addEventListener('input',()=>{$('edit-error').hidden=true;});
+$('edit-cancel').addEventListener('click',()=>{$('edit-dialog').close();editingCardId=null;});
+$('edit-dialog').addEventListener('cancel',()=>{editingCardId=null;});
+$('edit-form').addEventListener('submit',async event=>{
+  event.preventDefault();if(financialBusy||failure||!editingCardId)return;
+  const card=envelope.game.cards.find(c=>c.id===editingCardId);if(!card)return;
+  try{
+    const name=$('edit-name').value.trim(),price=parsePrice($('edit-price').value);
+    if(!name)throw new Error('اسم کارت را وارد کن.');
+    if(name===card.name&&price===card.price){$('edit-dialog').close();editingCardId=null;message('مشخصات کارت تغییری نکرد.');return;}
+    if(await act({type:'editCard',cardId:card.id,name,price},'اسم و قیمت کارت اصلاح شد؛ دورهای قبلی حفظ شدند.')){$('edit-dialog').close();editingCardId=null;}
+    else{$('edit-error').textContent=$('message').textContent;$('edit-error').hidden=false;}
+  }catch(error){$('edit-error').textContent=error.message;$('edit-error').hidden=false;}
+});
 async function replaceGame(imported){
   if(financialBusy)return;
   financialBusy=true;controls();
@@ -223,7 +291,7 @@ $('archive-list').addEventListener('click',event=>{
   if(button.dataset.restoreGame!==undefined){const game=envelope.archives[Number(button.dataset.restoreGame)];confirm('بازگرداندن بازی بایگانی‌شده',`${fa(game.cards.length)} کارت بازیابی می‌شود؛ دفتر فعلی هم بایگانی خواهد شد.`,()=>replaceGame(createEnvelope(clone(game))),'بازگردان');}
 });
 window.addEventListener('beforeunload',event=>{if(dirty||failure||drainPromise){event.preventDefault();event.returnValue='';}});
-$('build-id').textContent=`نسخه ۱ · ${__BUILD_ID__}`;
+$('build-id').textContent=`نسخه ۱٫۱ · ${__BUILD_ID__}`;
 try{envelope=await store.init();persistedRevision=envelope.revision;render();setStorage();}
 catch(error){failure=error;loadFailure=true;message(`دفتر باز نشد. ${error.message} دادهٔ قبلی جایگزین نشده؛ خروجی بازیابی بگیر یا فایل سالم را بازیابی کن.`,true);setStorage();}
 if('serviceWorker' in navigator&&import.meta.env.PROD){

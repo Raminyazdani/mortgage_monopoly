@@ -121,6 +121,55 @@ async function seedLegacy(page, value) {
   }, { key: LEGACY_KEY, fixture: value });
 }
 
+const events = (page, id) => page.locator(`[data-events="${id}"]`);
+const eventOf = (page, id, type) => events(page, id).locator(`[data-event-type="${type}"]`);
+
+async function showCardHistory(page, id) {
+  if (!await card(page, id).isVisible()) {
+    await page.locator('#history').evaluate((element) => { element.open = true; });
+  }
+  await page.locator(`[data-card-history="${id}"]`).evaluate((element) => { element.open = true; });
+  await expect(events(page, id)).toBeVisible();
+}
+
+async function editDialog(page, id) {
+  if (!await card(page, id).isVisible()) {
+    await page.locator('#history').evaluate((element) => { element.open = true; });
+  }
+  await page.locator(`[data-edit-card="${id}"]`).click();
+  await expect(page.locator('#edit-dialog')).toBeVisible();
+}
+
+async function saveCardEdit(page, id, name, price) {
+  await editDialog(page, id);
+  await page.locator('#edit-name').fill(name);
+  await page.locator('#edit-price').fill(String(price));
+  const revision = (await ledger(page)).revision;
+  await page.locator('#edit-save').click();
+  await persisted(page, (data) => data.revision > revision);
+  await expect(page.locator('#edit-dialog')).not.toBeVisible();
+}
+
+async function replaceStoredLedger(page, value) {
+  await page.evaluate(async ({ name, fixture }) => {
+    const database = await new Promise((resolve, reject) => {
+      const request = indexedDB.open(name);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction('ledger', 'readwrite');
+        transaction.objectStore('ledger').put(fixture, 'current');
+        transaction.oncomplete = resolve;
+        transaction.onerror = transaction.onabort = () => reject(transaction.error);
+      });
+    } finally { database.close(); }
+  }, { name: DB_NAME, fixture: value });
+  await page.reload();
+  await expect(page.locator('#add button')).toBeEnabled();
+}
+
 test('exact compound vector and only the owner’s active cards accrue interest', async ({ page }) => {
   await open(page);
   const first = await addCard(page, 'p1', 'خیابان اول', '۲۰۰');
@@ -647,4 +696,253 @@ test('a newly registered service worker preserves game data and unfinished input
   expect((await ledger(page)).game).toEqual(saved);
   await page.reload();
   await debt(page, id, 100);
+});
+
+test('card history explains each lap and transfer using names from the event time', async ({ page }) => {
+  await open(page);
+  await rename(page, 'p1', 'رامین اول');
+  await rename(page, 'p2', 'سارا اول');
+  const id = await addCard(page, 'p1', 'کارت با سابقه');
+  await lap(page);
+  await lap(page);
+  await rename(page, 'p1', 'رامین جدید');
+  await page.locator(`[data-transfer="${id}"]`).selectOption('p2');
+  await expect(seat(page, 'p2').locator(`[data-card="${id}"]`)).toBeVisible();
+  await debt(page, id, 121);
+  await rename(page, 'p2', 'سارا جدید');
+  await lap(page, 'p2');
+  await action(page, id, 'settle').click();
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'created')).toHaveCount(1);
+  await expect(eventOf(page, id, 'created')).toContainText('رامین اول');
+  await expect(eventOf(page, id, 'lap')).toHaveCount(3);
+  const lapTexts = await eventOf(page, id, 'lap').allTextContents();
+  expect(lapTexts.some((text) => text.includes('۱۱۰') && text.includes('۱۲۱'))).toBe(true);
+  await expect(eventOf(page, id, 'transfer')).toContainText('رامین جدید');
+  await expect(eventOf(page, id, 'transfer')).toContainText('سارا اول');
+  await expect(eventOf(page, id, 'transfer')).toContainText('۱۲۱');
+  await expect(eventOf(page, id, 'lap').filter({ hasText: 'سارا جدید' })).toContainText('۱۳۳');
+  await expect(eventOf(page, id, 'settle')).toContainText('۱۳۳');
+  await expect(card(page, id)).toHaveAttribute('data-paid', '133');
+  const visibleHistory = await events(page, id).textContent();
+  await page.reload();
+  await showCardHistory(page, id);
+  expect(await events(page, id).textContent()).toBe(visibleHistory);
+});
+
+test('editing card name and price previews without saving, retains laps and is one undo action', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p2', 'اسم پیش از اصلاح');
+  await lap(page, 'p2');
+  await lap(page, 'p2');
+  const before = await ledger(page);
+  await editDialog(page, id);
+  await expect(page.locator('#edit-name')).toHaveValue('اسم پیش از اصلاح');
+  await expect(page.locator('#edit-price')).toHaveValue(/200|۲۰۰/);
+  await page.locator('#edit-name').fill('اسم اصلاح‌شده');
+  await page.locator('#edit-price').fill('۳۰۰');
+  await expect(page.locator('#edit-preview')).toContainText('۱۸۲');
+  expect(await ledger(page)).toEqual(before);
+  await page.locator('#edit-save').click();
+  await expect(page.locator('#edit-dialog')).not.toBeVisible();
+  await debt(page, id, 182);
+  await persisted(page, (data) => data.game.cards.find((item) => item.id === id).price === 300);
+  const edited = await ledger(page);
+  expect(edited.undo.length).toBe(before.undo.length + 1);
+  expect(edited.game.cards.find((item) => item.id === id)).toMatchObject({
+    id, ownerId: 'p2', name: 'اسم اصلاح‌شده', price: 300, laps: 2, status: 'active',
+  });
+  await expect(seat(page, 'p2').locator(`[data-card="${id}"]`)).toBeVisible();
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'editCard')).toHaveCount(1);
+  await expect(eventOf(page, id, 'editCard')).toContainText('اسم پیش از اصلاح');
+  await expect(eventOf(page, id, 'editCard')).toContainText('اسم اصلاح‌شده');
+  await expect(eventOf(page, id, 'editCard')).toContainText('۲۰۰');
+  await expect(eventOf(page, id, 'editCard')).toContainText('۳۰۰');
+  await page.reload();
+  await debt(page, id, 182);
+  await undo(page);
+  await debt(page, id, 121);
+  expect((await ledger(page)).game).toEqual(before.game);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'editCard')).toHaveCount(0);
+  await expect(eventOf(page, id, 'lap')).toHaveCount(2);
+  await page.reload();
+  await debt(page, id, 121);
+  await expect(card(page, id)).toContainText('اسم پیش از اصلاح');
+});
+
+test('invalid or cancelled card corrections leave finance and undo unchanged', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'اصلاح لغوشده');
+  await lap(page);
+  const before = await ledger(page);
+  await editDialog(page, id);
+  await page.locator('#edit-name').fill('نام نباید ذخیره شود');
+  for (const invalidPrice of ['0', '-1', '1.5', 'Infinity', '1,20', '10,000,000,000']) {
+    await page.locator('#edit-price').fill(invalidPrice);
+    await page.locator('#edit-save').click();
+    await expect(page.locator('#edit-dialog')).toBeVisible();
+    await expect(page.locator('#edit-error')).toContainText(/قیمت|عدد|صحیح|معتبر|سقف/);
+    expect(await ledger(page)).toEqual(before);
+  }
+  await page.locator('#edit-price').fill('300');
+  await page.locator('#edit-name').fill('');
+  await page.locator('#edit-save').click();
+  await expect(page.locator('#edit-error')).toContainText(/اسم|نام/);
+  expect(await ledger(page)).toEqual(before);
+  await page.locator('#edit-name').fill('اصلاح بعد از لغو');
+  await expect(page.locator('#edit-preview')).toContainText('۱۶۵');
+  await page.locator('#edit-cancel').click();
+  await expect(page.locator('#edit-dialog')).not.toBeVisible();
+  expect(await ledger(page)).toEqual(before);
+  await debt(page, id, 110);
+  await editDialog(page, id);
+  await expect(page.locator('#edit-name')).toHaveValue('اصلاح لغوشده');
+  await expect(page.locator('#edit-price')).toHaveValue(/200|۲۰۰/);
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#edit-dialog')).not.toBeVisible();
+  expect(await ledger(page)).toEqual(before);
+});
+
+test('closed card corrections preserve paid settlement and frozen auction state', async ({ page }) => {
+  await open(page);
+  const settled = await addCard(page, 'p1', 'تسویه با پرداخت قطعی');
+  await lap(page);
+  await lap(page);
+  await action(page, settled, 'settle').click();
+  const payment = structuredClone((await ledger(page)).game.cards.find((item) => item.id === settled).settlement);
+  await saveCardEdit(page, settled, 'نام درست تسویه', '300');
+  await expect(card(page, settled)).toHaveAttribute('data-status', 'settled');
+  await expect(card(page, settled)).toHaveAttribute('data-paid', '121');
+  expect((await ledger(page)).game.cards.find((item) => item.id === settled)).toMatchObject({
+    ownerId: 'p1', price: 300, laps: 2, settlement: payment,
+  });
+  await showCardHistory(page, settled);
+  await expect(eventOf(page, settled, 'settle')).toContainText('۱۲۱');
+  await expect(eventOf(page, settled, 'editCard')).toHaveCount(1);
+  await undo(page);
+  await expect(card(page, settled)).toContainText('تسویه با پرداخت قطعی');
+  await expect(card(page, settled)).toHaveAttribute('data-paid', '121');
+
+  const auction = await addCard(page, 'p2', 'مزایده با سابقه');
+  for (let index = 0; index < 8; index += 1) await lap(page, 'p2');
+  await saveCardEdit(page, auction, 'نام درست آخرین شانس', '300');
+  await expect(card(page, auction)).toHaveAttribute('data-status', 'grace');
+  await debt(page, auction, 322);
+  expect((await ledger(page)).game.cards.find((item) => item.id === auction).laps).toBe(8);
+  await action(page, auction, 'auction').click();
+  await saveCardEdit(page, auction, 'نام درست مزایده', '400');
+  await expect(card(page, auction)).toHaveAttribute('data-status', 'auction');
+  await debt(page, auction, 429);
+  await expect(card(page, auction)).toContainText('۱۰۰');
+  await action(page, auction, 'closeAuction').click();
+  const closedAt = (await ledger(page)).game.cards.find((item) => item.id === auction).closedAt;
+  await saveCardEdit(page, auction, 'نام درست مزایده بسته', '500');
+  expect((await ledger(page)).game.cards.find((item) => item.id === auction)).toMatchObject({
+    ownerId: 'p2', status: 'auction_closed', price: 500, laps: 8, closedAt,
+  });
+  await showCardHistory(page, auction);
+  await expect(eventOf(page, auction, 'auction')).toHaveCount(1);
+  await expect(eventOf(page, auction, 'closeAuction')).toHaveCount(1);
+  await expect(eventOf(page, auction, 'editCard')).toHaveCount(3);
+  await page.reload();
+  await expect(card(page, settled)).toHaveAttribute('data-paid', '121');
+  await undo(page);
+  expect((await ledger(page)).game.cards.find((item) => item.id === auction)).toMatchObject({
+    name: 'نام درست مزایده', price: 400, laps: 8, status: 'auction_closed', closedAt,
+  });
+});
+
+test('a v2 ledger without events gains one honest baseline and retains all 50 undo snapshots', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'کارت نسخهٔ پیشین');
+  await lap(page);
+  await lap(page);
+  const old = await ledger(page);
+  for (const item of old.game.cards) delete item.history;
+  const financial = structuredClone(old.game.cards[0]);
+  old.revision = 80;
+  old.undo = Array.from({ length: 50 }, (_, index) => {
+    const game = structuredClone(old.game);
+    game.players[1].name = `نام تاریخی ${index}`;
+    return { label: `ویرایش تاریخی ${index}`, game };
+  });
+  old.archives = [structuredClone({ ...old.game, id: 'synthetic-archived-v2' })];
+  await replaceStoredLedger(page, old);
+  await debt(page, id, 121);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
+  await expect(eventOf(page, id, 'created')).toHaveCount(0);
+  await expect(eventOf(page, id, 'lap')).toHaveCount(0);
+  await expect(eventOf(page, id, 'baseline')).toContainText(/پیش|قبلی|قدیمی|از این|تاریخچه/);
+  expect((await ledger(page)).undo).toHaveLength(50);
+  await page.reload();
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
+  await saveCardEdit(page, id, 'اصلاح پس از به‌روزرسانی', '300');
+  expect((await ledger(page)).undo).toHaveLength(50);
+  await undo(page);
+  const restored = (await ledger(page)).game.cards.find((item) => item.id === id);
+  const { history, ...restoredFinancial } = restored;
+  expect(restoredFinancial).toEqual(financial);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
+  await expect(eventOf(page, id, 'editCard')).toHaveCount(0);
+  await undo(page);
+  await expect(page.locator('[data-name="p2"]')).toHaveValue('نام تاریخی 49');
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
+  await page.reload();
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
+  await debt(page, id, 121);
+  expect((await ledger(page)).undo).toHaveLength(48);
+  expect((await ledger(page)).archives[0].id).toBe('synthetic-archived-v2');
+});
+
+test('mobile history and correction dialog fit 360px and render edited HTML literally', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 360, height: 844 });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await open(page);
+  const id = await addCard(page, 'p1', 'کارت موبایل');
+  await lap(page);
+  if (process.env.CAPTURE_LEDGER_UI === '1') {
+    await showCardHistory(page, id);
+    await card(page, id).scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('card-history-360.png') });
+  }
+  const unsafe = '<img src=x onerror="window.cardEditInjected=1">';
+  await editDialog(page, id);
+  await page.locator('#edit-price').fill('۳۰۰');
+  if (process.env.CAPTURE_LEDGER_UI === '1') {
+    await page.locator('#edit-name').fill('خیابان با نام اصلاح‌شده');
+    await page.screenshot({ path: testInfo.outputPath('card-edit-dialog-360.png') });
+  }
+  await page.locator('#edit-name').fill(unsafe);
+  await expect(page.locator('#edit-preview')).toContainText('۱۶۵');
+  expect(await page.locator('#edit-dialog').evaluate((element) => {
+    const rectangle = element.getBoundingClientRect();
+    return rectangle.left >= -1 && rectangle.right <= innerWidth + 1
+      && element.scrollWidth <= element.clientWidth + 1;
+  })).toBe(true);
+  await page.locator('#edit-save').click();
+  await expect(page.locator('#edit-dialog')).not.toBeVisible();
+  await debt(page, id, 165);
+  await showCardHistory(page, id);
+  await expect(card(page, id)).toContainText(unsafe);
+  await expect(eventOf(page, id, 'editCard')).toContainText(unsafe);
+  await expect(card(page, id).locator('img')).toHaveCount(0);
+  expect(await page.evaluate(() => window.cardEditInjected)).toBeUndefined();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  const backup = await exportFile(page);
+  await importFile(page, backup);
+  await page.reload();
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'editCard')).toContainText(unsafe);
+  await expect(card(page, id).locator('img')).toHaveCount(0);
+  expect(await page.evaluate(() => window.cardEditInjected)).toBeUndefined();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(errors).toEqual([]);
 });

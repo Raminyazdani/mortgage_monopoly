@@ -6,3 +6,15 @@
 @media(min-width:1160px){.seats{grid-template-columns:repeat(4,minmax(0,1fr))}.seat-head{grid-template-columns:25px minmax(0,1fr);padding:12px}.seat-head .button{grid-column:1/-1}.seat-number{width:25px;height:25px}.card-actions{grid-template-columns:1fr}.amount{font-size:26px}}
 @media(max-width:700px){.shell{padding:20px 14px max(22px,env(safe-area-inset-bottom))}.topbar{margin-bottom:19px}.brand{gap:10px}.brand-mark{width:43px;height:46px;font-size:29px;border-radius:11px}h1{font-size:25px}.eyebrow{font-size:9px}.topbar .button{font-size:12px;padding:9px 12px}.intro{padding:17px;gap:12px;border-radius:14px}.intro strong{font-size:16px}.intro p{font-size:11px}.rule-badge{font-size:27px;padding-right:12px}.rule-badge small{font-size:9px}.add-panel{grid-template-columns:1fr 1fr;padding:15px;gap:10px}.add-panel label:nth-of-type(2){grid-column:1/-1;grid-row:3}.add-panel label:nth-of-type(3){grid-row:2;grid-column:2}.add-panel>.button{grid-column:1/-1;grid-row:4;font-size:15px}.form-heading{grid-row:1}.seats{grid-template-columns:1fr;gap:14px}.seat-head{padding:12px}.section-heading{margin-top:25px}.section-heading h2{font-size:19px}.bottom-panel{padding:16px;gap:15px}.bottom-panel>.tools{width:100%;display:grid;grid-template-columns:1fr 1fr}.bottom-panel #reset{grid-column:1/-1}.save-line{font-size:10px}.history-card .tools{width:100%}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+.edit-card-button{display:block;text-align:right;font-size:11px;padding:6px 0;max-width:100%}
+.card-history{border-top:1px dashed #b9c8af;margin-top:3px;width:100%;min-width:0}
+.card-history summary{font-size:11px;font-weight:600;min-height:44px;padding:11px 0;cursor:pointer}
+.card-history summary span{font-weight:400;color:var(--muted);margin-inline-start:5px}
+.card-history ol{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:9px;max-height:340px;overflow:auto;overscroll-behavior:contain}
+.card-history li{border-inline-start:2px solid #b2c49d;padding:4px 10px;min-width:0}
+.event-heading{display:flex;flex-direction:column;gap:2px}
+.event-heading b{font-size:11px}.event-heading small{font-size:9px;color:var(--muted)}
+.card-history li p{white-space:pre-line;overflow-wrap:anywhere;font-size:11px;line-height:1.9;color:var(--ink)}
+#edit-form{display:flex;flex-direction:column;gap:14px}
+#edit-preview{margin:0;padding:12px;border:1px solid #d0ddc4;background:#f0f5e8;border-radius:10px;font-size:12px;line-height:2}
+#edit-error{margin:0;color:var(--danger);font-size:12px}

@@ -42,6 +42,7 @@
         <p>بهره روی مقدار دقیق انباشته حساب می‌شود و فقط مبلغ نهایی گرد می‌شود؛ نصف‌ها به بالا. کارت ۲۰۰: ۱۰۰، ۱۱۰، ۱۲۱، ۱۳۳، ۱۴۶، ۱۶۱، ۱۷۷، ۱۹۵ و ۲۱۴. آخرین شانس با عبور دقیق از قیمت شروع می‌شود؛ زمان‌سنج ندارد و بدهی ثابت می‌ماند.</p>
         <p>قیمت فرد هم از نصف دقیق شروع می‌شود: کارت ۲۰۱، دریافت نمایشی ۱۰۱، دور اول ۱۱۱. مزایده از یک‌چهارم قیمت با همان گردکردن شروع می‌شود؛ ۱۵۰ ← ۳۸، ۲۰۱ ← ۵۰، ۲۰۲ ← ۵۱. انتقال بهره یا کارمزد ندارد. تسویه فقط کامل است.</p>
         <p>«برگردون» تا ۵۰ اقدام را حتی پس از بستن صفحه برمی‌گرداند. تسویه‌ها و مزایده‌های بسته در سوابق می‌مانند. پیش از بازی جدید یا بازیابی، دفتر فعلی بایگانی می‌شود.</p>
+        <p>در «تاریخچهٔ کارت»، ثبت، دور، انتقال، تسویه و مزایده را با مبلغ همان لحظه می‌بینی. «اصلاح اسم و قیمت» تعداد دورها را حفظ می‌کند و بدهی را با قیمت درست دوباره حساب می‌کند؛ مبلغ تسویهٔ قبلاً ثبت‌شده تغییر نمی‌کند. هر اصلاح یک اقدام قابل برگشت است. برای کارت‌های قبلی، تاریخچه از وضعیت موجود شروع می‌شود و اتفاقات ثبت‌نشدهٔ گذشته ساخته نمی‌شوند.</p>
         <p>هر مرورگر دفتر خودش را دارد. پاک‌کردن دادهٔ سایت یا حالت خصوصی ممکن است دفتر را از بین ببرد. برای جابه‌جایی بین گوشی‌ها یا آدرس‌ها، خروجی و بازیابی JSON را استفاده کن. هنگام استفادهٔ هم‌زمان در دو تب، تغییر ناسازگار متوقف می‌شود؛ نسخهٔ آخر را بخوان.</p>
         <p id="offline-status">بعد از آماده‌شدن نسخهٔ آفلاین، همین آدرس بدون شبکه هم باز می‌شود.</p>
         <p id="legacy-notice" hidden></p>
@@ -49,6 +50,16 @@
       <footer>یک دفتر برای دورِ هم بازی کردن <span id="build-id"></span></footer>
     </div>
     <dialog id="confirm-dialog" aria-labelledby="dialog-title"><h2 id="dialog-title"></h2><p id="dialog-body"></p><div class="tools"><button id="confirm-action" class="button primary">تأیید</button><button id="cancel-action" class="button secondary">انصراف</button></div></dialog>
+    <dialog id="edit-dialog" aria-labelledby="edit-title">
+      <h2 id="edit-title">اصلاح اسم و قیمت کارت</h2>
+      <form id="edit-form" novalidate>
+        <label for="edit-name">اسم کارت<input id="edit-name" maxlength="120" autocomplete="off" required /></label>
+        <label for="edit-price">قیمت اصلی کارت<input id="edit-price" inputmode="numeric" maxlength="20" autocomplete="off" required /></label>
+        <p id="edit-preview" role="status" aria-live="polite"></p>
+        <p id="edit-error" role="alert" hidden></p>
+        <div class="tools"><button id="edit-save" class="button primary" type="submit">ثبت اصلاح</button><button id="edit-cancel" class="button secondary" type="button">انصراف</button></div>
+      </form>
+    </dialog>
     <noscript>برای کار با دفتر، جاوااسکریپت مرورگر باید فعال باشد.</noscript>
     <script type="module" src="/src/main.js"></script>
   </body>

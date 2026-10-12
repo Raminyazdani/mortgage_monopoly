@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
-import { applyAction, createGame } from '../src/domain.js';
+import { applyAction, createGame, hydrateGameHistory } from '../src/domain.js';
 import {
-  CURRENT_KEY, DB_NAME, LEGACY_KEY, MAX_ARCHIVES, MAX_IMPORT_BYTES, STORE_NAME,
+  CURRENT_KEY, DB_NAME, LEGACY_KEY, MAX_ARCHIVES, MAX_IMPORT_BYTES, MAX_TOTAL_HISTORY_EVENTS, STORE_NAME,
   LedgerStore, createEnvelope, exportEnvelope, parseImport, validateEnvelope,
 } from '../src/storage.js';
 
@@ -25,6 +25,11 @@ function setup(localStorage = memoryStorage()) {
 
 const added = game => applyAction(game, { type: 'add', ownerId: 'p1', name: 'خیابان نمونه', price: 200 });
 const renamed = (envelope, name) => ({ ...envelope, game: applyAction(envelope.game, { type: 'rename', ownerId: 'p1', name }) });
+const withoutHistory = game => {
+  const old = structuredClone(game);
+  for (const card of old.cards) delete card.history;
+  return old;
+};
 
 async function rawTransaction(indexedDB, action, mode = 'readonly') {
   const db = await new Promise((resolve, reject) => {
@@ -234,10 +239,11 @@ test('a full 50-action history plus 30 archived 500-card games exports past 5MiB
   const game = createGame(Array(8).fill('نام فارسی'));
   const template = added(game).cards[0];
   game.cards = Array.from({ length: 500 }, (_, index) => ({ ...template,
-    id: `fixture-card-${index}`, name: 'خیابان طولانی برای آزمایش سابقه و بازیابی'.repeat(2) }));
-  const envelope = createEnvelope(game);
-  envelope.undo = Array.from({ length: 50 }, () => ({ label: 'اقدام آزمایشی', game }));
-  envelope.archives = Array(30).fill(game);
+    id: `fixture-card-${index}`, name: 'خیابان طولانی برای آزمایش سابقه و بازیابی'.repeat(2), history: undefined }));
+  const hydrated = hydrateGameHistory(game);
+  const envelope = createEnvelope(hydrated);
+  envelope.undo = Array.from({ length: 50 }, () => ({ label: 'اقدام آزمایشی', game: hydrated }));
+  envelope.archives = Array(30).fill(hydrated);
   const exported = exportEnvelope(envelope);
   const size = new TextEncoder().encode(exported).byteLength;
   assert.ok(size > 5 * 1024 * 1024);
@@ -246,7 +252,202 @@ test('a full 50-action history plus 30 archived 500-card games exports past 5MiB
   assert.equal(imported.undo.length, 50);
   assert.equal(imported.archives.length, 30);
   assert.equal(imported.game.cards.length, 500);
-  assert.deepEqual(imported.game, game);
+  assert.deepEqual(imported.game, hydrated);
+});
+
+test('existing schema-2 saves atomically persist honest baselines for current, undo and archives once', async () => {
+  const { store, options, indexedDB } = setup();
+  const beforeLap = added(createGame(['رامین']));
+  const old = {
+    schemaVersion: 2, revision: 7,
+    game: withoutHistory(applyAction(beforeLap, { type: 'lap', ownerId: 'p1' })),
+    undo: [{ label: 'دور قدیمی', game: withoutHistory(beforeLap) }],
+    archives: [withoutHistory(added(createGame(['قدیمی'])))],
+  };
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  try {
+    const upgraded = await store.init();
+    assert.equal(upgraded.schemaVersion, 2);
+    assert.equal(upgraded.revision, 8);
+    for (const game of [upgraded.game, upgraded.undo[0].game, upgraded.archives[0]]) {
+      const [event] = game.cards[0].history;
+      assert.equal(game.cards[0].history.length, 1);
+      assert.equal(event.type, 'baseline');
+      assert.equal(event.at, null);
+      assert.equal(event.before, null);
+      assert.equal(event.after.laps, game.cards[0].laps);
+      assert.equal(event.after.price, game.cards[0].price);
+    }
+    assert.equal(upgraded.game.cards[0].laps, 1);
+    assert.equal(upgraded.undo[0].game.cards[0].laps, 0);
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), upgraded);
+    assert.deepEqual(await store.reload(), upgraded);
+    assert.deepEqual(parseImport(exportEnvelope(upgraded)), upgraded);
+    const reopened = new LedgerStore(options);
+    try { assert.deepEqual(await reopened.init(), upgraded); }
+    finally { reopened.close(); }
+  } finally { store.close(); }
+});
+
+test('two simultaneous upgrades commit one revision and reuse the winner baseline IDs', async () => {
+  const { store: first, options, indexedDB } = setup();
+  const second = new LedgerStore(options);
+  const old = { ...createEnvelope(withoutHistory(added(createGame()))), revision: 4 };
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  try {
+    const [a, b] = await Promise.all([first.init(), second.init()]);
+    assert.equal(a.revision, 5);
+    assert.deepEqual(a, b);
+    assert.equal(a.game.cards[0].history.length, 1);
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), a);
+  } finally { first.close(); second.close(); }
+});
+
+test('an old app action appends one unknown-time gap while a player-name change preserves event-time names', async () => {
+  const { store, indexedDB } = setup();
+  try {
+    const initial = await store.init();
+    const game = added(createGame(['رامین']));
+    const original = await store.save({ ...initial, game }, initial.revision);
+    const oldTab = structuredClone(original);
+    oldTab.game.cards[0].laps = 2;
+    oldTab.revision += 1;
+    await rawTransaction(indexedDB, objectStore => objectStore.put(oldTab, CURRENT_KEY), 'readwrite');
+    const upgraded = await store.reload();
+    assert.equal(upgraded.revision, oldTab.revision + 1);
+    assert.equal(upgraded.game.cards[0].history.length, 2);
+    const gap = upgraded.game.cards[0].history.at(-1);
+    assert.equal(gap.type, 'baseline');
+    assert.equal(gap.at, null);
+    assert.equal(gap.before, null);
+    assert.equal(gap.after.laps, 2);
+    assert.equal(gap.after.debt, 121);
+    assert.deepEqual(upgraded.game.cards[0].history[0], original.game.cards[0].history[0]);
+    assert.deepEqual(await store.reload(), upgraded);
+    assert.deepEqual(parseImport(exportEnvelope(upgraded)), upgraded);
+
+    const renamedOldTab = structuredClone(upgraded);
+    renamedOldTab.game.players[0].name = 'نام تازه';
+    renamedOldTab.revision += 1;
+    renamedOldTab.ignoredEnvelopeMetadata = 'preserve on disk without an upgrade';
+    await rawTransaction(indexedDB, objectStore => objectStore.put(renamedOldTab, CURRENT_KEY), 'readwrite');
+    const reloaded = await store.reload();
+    assert.equal(reloaded.revision, renamedOldTab.revision);
+    assert.equal(reloaded.game.cards[0].history.length, 2);
+    assert.equal(reloaded.game.cards[0].history.at(-1).after.ownerName, 'رامین');
+    assert.equal((await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY))).ignoredEnvelopeMetadata,
+      renamedOldTab.ignoredEnvelopeMetadata);
+  } finally { store.close(); }
+});
+
+test('failed additive upgrade leaves the old healthy financial snapshot and exposes pending history', async () => {
+  const { store, indexedDB } = setup();
+  const old = { ...createEnvelope(withoutHistory(added(createGame()))), revision: 9 };
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  const originalPut = IDBObjectStore.prototype.put;
+  try {
+    IDBObjectStore.prototype.put = function () { throw new DOMException('Test quota exhausted', 'QuotaExceededError'); };
+    await assert.rejects(store.init(), error => error.code === 'QUOTA');
+    assert.equal(store.lastGood, null);
+    assert.equal(store.pending.game.cards[0].history[0].type, 'baseline');
+    assert.deepEqual(JSON.parse(store.readRaw()), old);
+    IDBObjectStore.prototype.put = originalPut;
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), old);
+    await assert.rejects(store.recover(createEnvelope()), error => error.code === 'CONFLICT');
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), old);
+    const upgraded = await store.reload();
+    assert.equal(upgraded.revision, 10);
+    assert.equal(upgraded.game.cards[0].laps, 0);
+    assert.equal(upgraded.game.cards[0].price, 200);
+  } finally { IDBObjectStore.prototype.put = originalPut; store.close(); }
+});
+
+test('an edited card and its event remain in pending recovery while failed save preserves the previous price and laps', async () => {
+  const { store } = setup();
+  const originalPut = IDBObjectStore.prototype.put;
+  try {
+    const initial = await store.init();
+    let game = added(initial.game);
+    game = applyAction(applyAction(game, { type: 'lap', ownerId: 'p1' }), { type: 'lap', ownerId: 'p1' });
+    const before = await store.save({ ...initial, game }, initial.revision);
+    const candidate = { ...before,
+      game: applyAction(game, { type: 'editCard', cardId: game.cards[0].id, name: 'نام اصلاح‌شده', price: 201 }),
+      undo: [{ label: 'اصلاح کارت', game }],
+    };
+    IDBObjectStore.prototype.put = function () { throw new DOMException('Test quota exhausted', 'QuotaExceededError'); };
+    await assert.rejects(store.save(candidate, before.revision), error => error.code === 'QUOTA');
+    assert.deepEqual(store.lastGood, before);
+    assert.deepEqual(store.pending, candidate);
+    assert.equal(parseImport(exportEnvelope(store.pending)).game.cards[0].history.at(-1).type, 'editCard');
+    IDBObjectStore.prototype.put = originalPut;
+    assert.deepEqual(await store.reload(), before);
+    const saved = await store.save(candidate, before.revision);
+    assert.equal(saved.game.cards[0].price, 201);
+    assert.equal(saved.game.cards[0].laps, 2);
+    assert.equal(saved.game.cards[0].history.at(-1).after.debt, 122);
+    const undone = await store.save({ ...saved, game: saved.undo[0].game, undo: [] }, saved.revision);
+    assert.equal(undone.game.cards[0].name, 'خیابان نمونه');
+    assert.equal(undone.game.cards[0].price, 200);
+    assert.equal(undone.game.cards[0].laps, 2);
+    assert.equal(undone.game.cards[0].history.at(-1).type, 'lap');
+    assert.deepEqual(parseImport(exportEnvelope(undone)), undone);
+  } finally { IDBObjectStore.prototype.put = originalPut; store.close(); }
+});
+
+test('concurrent edits use the existing revision guard and preserve the winner event log', async () => {
+  const { store: first, options } = setup();
+  const second = new LedgerStore(options);
+  try {
+    const initial = await first.init();
+    const before = await first.save({ ...initial, game: added(initial.game) }, initial.revision);
+    const other = await second.init();
+    const edit = (envelope, name, price) => ({ ...envelope,
+      game: applyAction(envelope.game, { type: 'editCard', cardId: envelope.game.cards[0].id, name, price }),
+      undo: [{ label: 'اصلاح کارت', game: envelope.game }],
+    });
+    const results = await Promise.allSettled([
+      first.save(edit(before, 'الف', 201), before.revision),
+      second.save(edit(other, 'ب', 400), other.revision),
+    ]);
+    const winner = results.find(result => result.status === 'fulfilled').value;
+    const loser = results.find(result => result.status === 'rejected').reason;
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(loser.code, 'CONFLICT');
+    assert.deepEqual(loser.latest, winner);
+    assert.equal(winner.game.cards[0].history.at(-1).type, 'editCard');
+    assert.deepEqual(await second.reload(), winner);
+  } finally { first.close(); second.close(); }
+});
+
+test('history import validates events and bounds the aggregate before traversing event snapshots', () => {
+  const valid = createEnvelope(added(createGame()));
+  for (const mutate of [
+    envelope => { envelope.game.cards[0].history = []; },
+    envelope => { envelope.game.cards[0].history = 'not an array'; },
+    envelope => { envelope.game.cards[0].history[0].type = 'unknown'; },
+    envelope => { envelope.game.cards[0].history[0].at = '2026-02-31T00:00:00.000Z'; },
+    envelope => { envelope.game.cards[0].history[0].after.laps = 1_000_000; },
+    envelope => { envelope.game.cards[0].history[0].after.debt += 1; },
+    envelope => { envelope.game.cards[0].history = Array(501).fill(envelope.game.cards[0].history[0]); },
+  ]) {
+    const invalid = structuredClone(valid);
+    mutate(invalid);
+    assert.throws(() => parseImport(JSON.stringify(invalid)), error => error.code === 'INVALID_DATA');
+  }
+  const event = valid.game.cards[0].history[0];
+  const fullGap = structuredClone(valid);
+  fullGap.game.cards[0].history = Array.from({ length: 500 }, (_, index) => ({
+    id: `full-baseline-${index}`, type: 'baseline', at: null, before: null, after: structuredClone(event.after),
+  }));
+  fullGap.game.cards[0].laps = 2;
+  assert.throws(() => parseImport(JSON.stringify(fullGap)), error => error.code === 'INVALID_DATA');
+  const tooLarge = structuredClone(valid);
+  tooLarge.game.cards = Array.from({ length: Math.floor(MAX_TOTAL_HISTORY_EVENTS / 500) + 1 }, (_, index) => ({
+    ...valid.game.cards[0], id: `bounded-${index}`, history: Array(500).fill(event),
+  }));
+  // These repeated events are intentionally invalid too: the aggregate count
+  // must reject them before per-event validation or rational arithmetic.
+  assert.throws(() => validateEnvelope(tooLarge), /مجموع تاریخچه/);
 });
 
 test('unavailable browser storage fails clearly without fabricating a saved game', async () => {
