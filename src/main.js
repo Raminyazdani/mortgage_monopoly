@@ -1,5 +1,5 @@
 import './style.css';
-import { createGame, applyAction, calculate, canLap, parsePrice } from './domain.js';
+import { createGame, applyAction, calculate, canLap, canLapAll, parsePrice, parseRate } from './domain.js';
 import { LedgerStore, createEnvelope, exportEnvelope, parseImport, MAX_IMPORT_BYTES } from './storage.js';
 
 const $ = id => document.getElementById(id);
@@ -8,7 +8,7 @@ const escape = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&
 const clone = value => structuredClone(value);
 const colors=['#926142','#6faec7','#ba528d','#dd913b','#c85843','#b89b34','#498955','#4973ae'];
 let envelope, persistedRevision=0, dirty=false, failure=null, loadFailure=false, financialBusy=false;
-let drainPromise=null, nameSession=null, confirmCallback=null, editingCardId=null;
+let drainPromise=null, nameSession=null, confirmCallback=null, editingCardId=null, rulesDraftDirty=false;
 let openCardHistories=new Set();
 const lastLap=new Map();
 const store = new LedgerStore({onChange:async event=>{
@@ -26,6 +26,21 @@ function name(player){const index=envelope.game.players.indexOf(player);return p
 function optionLabel(player,index){return `${player.name || 'بازیکن'} · جایگاه ${fa(index+1)}`;}
 function ownerName(ownerId,game=envelope.game){const index=game.players.findIndex(p=>p.id===ownerId);return game.players[index]?.name||`بازیکن ${fa(index+1)}`;}
 function options(exclude){return envelope.game.players.map((p,i)=>p.id===exclude?'':`<option value="${escape(p.id)}">${escape(optionLabel(p,i))}</option>`).join('');}
+function rateText(rateBps){return `${fa(rateBps/100)}٪`;}
+function interestText(interest){return `${interest.mode==='compound'?'مرکب':'ساده'} ${rateText(interest.rateBps)}`;}
+function renderRules(force=false){
+  if(!envelope)return;
+  const rules=envelope.game.rules;
+  const rate=rules.mode==='compound'?rules.compoundRateBps:rules.simpleRateBps;
+  $('active-rate').textContent=rateText(rate);
+  $('active-mode').textContent=`بهرهٔ ${rules.mode==='compound'?'مرکب':'ساده'}`;
+  $('active-rule').textContent=`هر دور، ${rateText(rate)} ${rules.mode==='compound'?'روی بدهی همان لحظه':'از مبلغ اولیهٔ مورگیج'}. بعد از عبور از قیمت کارت، یک شانس تسویه.${rules.hardcore?' هاردکور روشن است؛ دور هر نفر برای همه ثبت می‌شود.':''}`;
+  $('rules-summary').textContent=`${rules.mode==='compound'?'مرکب':'ساده'} ${rateText(rate)}${rules.hardcore?' · هاردکور روشن':''}`;
+  if(force||!rulesDraftDirty){
+    $('interest-mode').value=rules.mode;$('compound-rate').value=String(rules.compoundRateBps/100);$('simple-rate').value=String(rules.simpleRateBps/100);$('hardcore').checked=rules.hardcore;rulesDraftDirty=false;
+    $('rules-note').textContent='بدهی فعلی حفظ می‌شود. تنظیم جدید فقط برای دورهای بعد است. نرخ از ۰ تا ۱۰۰ درصد، با حداکثر دو رقم اعشار.';
+  }
+}
 function synchronizeNames(){
   const selected=$('who').value;
   $('who').innerHTML=options(); if(selected)$('who').value=selected;
@@ -44,6 +59,9 @@ function controls(){
   for(const button of document.querySelectorAll('[data-lap]'))button.disabled=blocked||!!drainPromise||!canLap(envelope.game,button.dataset.lap);
   for(const node of document.querySelectorAll('[data-action],[data-transfer],[data-restore-game],[data-edit-card]'))node.disabled=blocked||!!drainPromise;
   $('edit-save').disabled=blocked||!!drainPromise;
+  $('lap-all').disabled=blocked||!!drainPromise||!envelope||!canLapAll(envelope.game);
+  $('save-rules').disabled=blocked||!!drainPromise;
+  for(const field of $('rules-form').querySelectorAll('input,select'))field.disabled=blocked;
 }
 function setStorage(){
   if(failure){$('storage-status').textContent=loadFailure?'دادهٔ قبلی باز نشد و جایگزین نشده؛ خروجی بازیابی یا فایل سالم را استفاده کن.':'ذخیره نشد؛ تغییر روی صفحه است، نسخهٔ قبلی هنوز محفوظ است.';$('retry-save').hidden=loadFailure;$('reload-latest').hidden=false;}
@@ -89,11 +107,15 @@ function historicalOwner(snapshot){
 }
 function cardEventHTML(event){
   const before=event.before, after=event.after;
-  const labels={baseline:'وضعیت قبلی کارت',created:'ثبت مورگیج',lap:'دور کامل',transfer:'انتقال کارت',settle:'تسویه',auction:'شروع مزایده',closeAuction:'پایان مزایده',editCard:'اصلاح اسم و قیمت'};
+  const labels={baseline:'وضعیت قبلی کارت',created:'ثبت مورگیج',lap:'دور کامل',lapAll:'دور جمعی برای همه',rulesChanged:'تغییر تنظیمات برای دور بعد',transfer:'انتقال کارت',settle:'تسویه',auction:'شروع مزایده',closeAuction:'پایان مزایده',editCard:'اصلاح اسم و قیمت'};
   let detail='';
   if(event.type==='baseline')detail=`جزئیات اتفاقات پیش از این نقطه ثبت نشده است. ${historicalOwner(after)} · دور ${fa(after.laps)} · قیمت ${fa(after.price)} · بدهی ${fa(after.debt)}${after.paid!==null?` · پرداخت ثبت‌شده ${fa(after.paid)}`:''}`;
   if(event.type==='created')detail=`${historicalOwner(after)} · ${after.name} · قیمت ${fa(after.price)} · دریافت ${fa(after.debt)}`;
-  if(event.type==='lap')detail=`${historicalOwner(after)} دور زد · ${fa(before.debt)} ← ${fa(after.debt)} · دور ${fa(after.laps)}${after.status==='grace'?' · آخرین شانس':''}`;
+  if(event.type==='lap'||event.type==='lapAll')detail=`${event.type==='lapAll'?`یک دور برای همه${event.triggerOwnerId?` با دور زدن ${event.triggerOwnerName||'بازیکن'} · جایگاه ${fa(Number(event.triggerOwnerId.slice(1)))}`:''}`:`${historicalOwner(after)} دور زد`} · ${fa(before.debt)} ← ${fa(after.debt)} · دور ${fa(after.laps)}${event.interest?` · ${interestText(event.interest)}`:''}${after.status==='grace'?' · آخرین شانس':''}`;
+  if(event.type==='rulesChanged'){
+    const rules=event.rulesAfter;
+    detail=`از دور بعد: ${rules.mode==='compound'?'مرکب':'ساده'} ${rateText(rules.mode==='compound'?rules.compoundRateBps:rules.simpleRateBps)} · هاردکور ${rules.hardcore?'روشن':'خاموش'}\nبدهی ${fa(after.debt)} و دور ${fa(after.laps)} تغییر نکردند.`;
+  }
   if(event.type==='transfer')detail=`از ${historicalOwner(before)} به ${historicalOwner(after)} · بدهی ${fa(after.debt)} · دور ${fa(after.laps)}`;
   if(event.type==='settle')detail=`${historicalOwner(after)} مبلغ ${fa(after.paid)} داد · ${after.name}`;
   if(event.type==='auction')detail=`${after.name} · شروع از ${fa(calculate(after,envelope.game.model).bid)} · بدهی ثابت ${fa(after.debt)}`;
@@ -115,7 +137,7 @@ function cardHistoryHTML(card){
 }
 function editCardButton(card){return `<button type="button" class="text-button edit-card-button" data-edit-card="${escape(card.id)}">اصلاح اسم و قیمت</button>`;}
 function cardHTML(card){
-  const amounts=calculate(card,envelope.game.model);
+  const amounts=calculate(card,envelope.game.model,envelope.game.rules);
   const status=card.status,warning=status==='active'&&amounts.nextOver;
   const labels={active:warning?'نزدیک سقف':'در مورگیج',grace:'آخرین شانس',auction:'در مزایده'};
   const settle=`<button class="button ${status==='grace'?'primary':'secondary'}" data-action="settle" data-id="${escape(card.id)}">تسویه کرد · ${fa(amounts.debt)}</button>`;
@@ -144,10 +166,10 @@ function render(){
   const game=envelope.game;
   $('seats').innerHTML=game.players.map((player,index)=>{
     const cards=game.cards.filter(c=>c.ownerId===player.id&&['active','grace','auction'].includes(c.status));
-    const debt=cards.filter(c=>['active','grace'].includes(c.status)).reduce((sum,c)=>sum+calculate(c,game.model).debt,0);
+    const debt=cards.filter(c=>['active','grace'].includes(c.status)).reduce((sum,c)=>sum+calculate(c,game.model,game.rules).debt,0);
     const grace=cards.filter(c=>c.status==='grace').length;
     return `<section class="seat" data-player="${player.id}" style="--seat:${colors[index]}">
-      <div class="seat-head"><span class="seat-number">${fa(index+1)}</span><input data-name="${player.id}" maxlength="80" autocomplete="off" aria-label="اسم بازیکن ${fa(index+1)}" placeholder="اسم بازیکن ${fa(index+1)}" value="${escape(player.name)}"><button class="button primary" data-lap="${player.id}">دور زد</button></div>
+      <div class="seat-head"><span class="seat-number">${fa(index+1)}</span><input data-name="${player.id}" maxlength="80" autocomplete="off" aria-label="اسم بازیکن ${fa(index+1)}" placeholder="اسم بازیکن ${fa(index+1)}" value="${escape(player.name)}"><button class="button primary" data-lap="${player.id}">${game.rules.hardcore?'دور زد · همه':'دور زد'}</button></div>
       <div class="seat-stats"><span>${fa(cards.length)} کارت جاری</span><span>جمع بدهی ${fa(debt)}</span></div>
       ${grace?`<p class="seat-note">${fa(grace)} کارت در آخرین شانس؛ قبل از دور تازه تعیین تکلیف کن.</p>`:''}
       <div class="card-list">${cards.length?cards.map(cardHTML).join(''):'<p class="empty">هنوز کارتی در مورگیج ندارد.</p>'}</div>
@@ -161,8 +183,8 @@ function render(){
   $('archive-list').innerHTML=envelope.archives.map((archive,index)=>`<div class="history-card"><div><b>بازی بایگانی‌شده ${fa(index+1)}</b><p>${fa(archive.cards.length)} کارت · ${escape(archive.players.map(p=>p.name||'بازیکن').join('، '))}</p></div><div class="tools"><button class="button secondary" data-export-game="${index}">خروجی</button><button class="button secondary" data-restore-game="${index}">بازگرداندن</button></div></div>`).join('')||'<p class="empty">با بازی جدید یا بازیابی، دفتر قبلی اینجا حفظ می‌شود.</p>';
   $('summary').textContent=`${fa(game.cards.filter(c=>['active','grace'].includes(c.status)).length)} کارت در مورگیج`;
   $('legacy-notice').hidden=game.model!=='legacy-simple'&&!game.migration;
-  $('legacy-notice').textContent=game.model==='legacy-simple'?'این دفتر قدیمی با بهرهٔ ثابت بازیابی شده و قانون تاریخی آن حفظ می‌شود. بازی جدید همیشه مرکب است.':game.migration?.compoundDefaulted?'مدل فایل قدیمی مشخص نبود؛ طبق رفتار نسخهٔ قدیمی، مرکب در نظر گرفته شد.':'';
-  document.querySelector('.rule-badge small').textContent=game.model==='legacy-simple'?'ثابتِ دفتر قدیمی':'بهرهٔ مرکب';
+  $('legacy-notice').textContent=game.model==='legacy-simple'?'دورهای قبلی این دفتر با بهرهٔ سادهٔ ۱۰٪ حفظ شده‌اند. تنظیمات جدید فقط از دور بعد اثر می‌گذارند.':game.migration?.compoundDefaulted?'مدل فایل قدیمی مشخص نبود؛ طبق رفتار نسخهٔ قدیمی، دورهای قبلی مرکب در نظر گرفته شدند.':'';
+  renderRules();
   controls();
 }
 function confirm(title,body,callback,label='تأیید'){
@@ -175,7 +197,7 @@ function editPreview(){
   if(!card)return;
   try{
     const price=parsePrice($('edit-price').value);
-    const old=calculate(card,envelope.game.model),next=calculate({...card,price},envelope.game.model);
+    const old=calculate(card,envelope.game.model,envelope.game.rules),next=calculate({...card,price},envelope.game.model,envelope.game.rules);
     $('edit-preview').textContent=`دور ${fa(card.laps)} حفظ می‌شود.\nبدهی: ${fa(old.debt)} ← ${fa(next.debt)}\nدریافت اولیه: ${fa(old.loan)} ← ${fa(next.loan)}${['auction','auction_closed'].includes(card.status)?`\nشروع مزایده: ${fa(old.bid)} ← ${fa(next.bid)}`:''}${card.settlement?`\nمبلغ تسویهٔ ثبت‌شده ${fa(card.settlement.amount)} ثابت می‌ماند.`:''}\nاصلاح با «برگردون» قابل برگشت است.`;
     $('edit-error').hidden=true;
   }catch(error){$('edit-preview').textContent=error.message;}
@@ -215,7 +237,7 @@ async function replaceGame(imported){
     }
     if(loadFailure){envelope=await store.recover(next);persistedRevision=envelope.revision;loadFailure=false;failure=null;dirty=false;}
     else{envelope=next;envelope.revision=persistedRevision;dirty=true;await flush();}
-    nameSession=null;lastLap.clear();render();setStorage();if(!failure)message('دفتر آماده شد؛ بازی قبلی در بایگانی محفوظ است.');
+    nameSession=null;lastLap.clear();rulesDraftDirty=false;render();setStorage();if(!failure)message('دفتر آماده شد؛ بازی قبلی در بایگانی محفوظ است.');
   }finally{financialBusy=false;controls();}
 }
 function download(data,filename){const url=URL.createObjectURL(new Blob([data],{type:'application/json;charset=utf-8'}));const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;anchor.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
@@ -230,10 +252,29 @@ $('import-file').addEventListener('change',async event=>{
   try{
     if(file.size>MAX_IMPORT_BYTES)throw new Error(`فایل بزرگ‌تر از ${fa(MAX_IMPORT_BYTES/1024/1024)} مگابایت پذیرفته نیست.`);
     const imported=parseImport(await file.text());
-    confirm('بازیابی دفتر',`${fa(imported.game.cards.length)} کارت و ${fa(imported.archives.length)} بازی بایگانی‌شده خوانده شد.\nمدل: ${imported.game.model==='legacy-simple'?'بهرهٔ ثابتِ قدیمی':'بهرهٔ مرکب'}.\nدفتر فعلی پیش از جایگزینی حفظ می‌شود.`,()=>replaceGame(imported),'بازیابی کن');
+    const importedRules=imported.game.rules;
+    confirm('بازیابی دفتر',`${fa(imported.game.cards.length)} کارت و ${fa(imported.archives.length)} بازی بایگانی‌شده خوانده شد.\nبهرهٔ ${importedRules.mode==='compound'?'مرکب':'ساده'} ${rateText(importedRules.mode==='compound'?importedRules.compoundRateBps:importedRules.simpleRateBps)} · هاردکور ${importedRules.hardcore?'روشن':'خاموش'}.\nدفتر فعلی پیش از جایگزینی حفظ می‌شود.`,()=>replaceGame(imported),'بازیابی کن');
   }catch(error){message(`بازیابی انجام نشد. ${error.message}`,true);}
 });
-$('reset').addEventListener('click',()=>confirm('بازی جدید',loadFailure?'دادهٔ خراب پیش از جایگزینی به‌صورت خام حفظ می‌شود. اگر لازم است، ابتدا خروجی بازیابی بگیر.':'دفتر فعلی بایگانی می‌شود و هشت اسم باقی می‌مانند. کارت‌های بازی تازه از ابتدا با بهرهٔ مرکب ثبت می‌شوند.',()=>replaceGame(createEnvelope(createGame(envelope?.game.players.map(p=>p.name)||[]))),'شروع بازی جدید'));
+$('reset').addEventListener('click',()=>confirm('بازی جدید',loadFailure?'دادهٔ خراب پیش از جایگزینی به‌صورت خام حفظ می‌شود. اگر لازم است، ابتدا خروجی بازیابی بگیر.':'دفتر فعلی بایگانی می‌شود؛ هشت اسم و تنظیمات ثبت‌شدهٔ بهره و هاردکور باقی می‌مانند.',()=>replaceGame(createEnvelope(createGame(envelope?.game.players.map(p=>p.name)||[],envelope?.game.rules))),'شروع بازی جدید'));
+$('rules-form').addEventListener('input',()=>{rulesDraftDirty=true;$('rules-error').hidden=true;$('rules-note').textContent='تنظیم جدید هنوز ثبت نشده؛ برای اثر از دور بعد، «اعمال از دور بعد» را بزن.';});
+$('rules-form').addEventListener('change',()=>{rulesDraftDirty=true;$('rules-error').hidden=true;$('rules-note').textContent='تنظیم جدید هنوز ثبت نشده؛ برای اثر از دور بعد، «اعمال از دور بعد» را بزن.';});
+$('rules-form').addEventListener('submit',async event=>{
+  event.preventDefault();if(financialBusy||failure||!envelope)return;
+  try{
+    const rules={mode:$('interest-mode').value,compoundRateBps:parseRate($('compound-rate').value),simpleRateBps:parseRate($('simple-rate').value),hardcore:$('hardcore').checked};
+    if(Object.keys(rules).every(key=>rules[key]===envelope.game.rules[key])){rulesDraftDirty=false;renderRules(true);message('تنظیمات تغییری نکرد.');return;}
+    if(await act({type:'setRules',rules},'تنظیمات ثبت شد؛ بدهی قبلی حفظ می‌شود و اثر از دور بعد است.')){rulesDraftDirty=false;lastLap.clear();renderRules(true);$('rules-error').hidden=true;}
+    else{$('rules-error').textContent=$('message').textContent;$('rules-error').hidden=false;}
+  }catch(error){$('rules-error').textContent=error.message;$('rules-error').hidden=false;}
+});
+$('lap-all').addEventListener('click',async()=>{
+  if($('lap-all').disabled||financialBusy)return;
+  const now=performance.now();
+  if(now-(lastLap.get('all')||-Infinity)<400){message('همین دور جمعی ثبت شد؛ برای دور بعد کمی مکث کن.');return;}
+  lastLap.set('all',now);
+  await act({type:'lapAll'},'یک دور جمعی ثبت شد؛ کارت‌های فعالِ بازیکنان واجد شرایط بهره گرفتند.');
+});
 $('add').addEventListener('submit',async event=>{
   event.preventDefault();if(financialBusy)return;
   try{
@@ -256,10 +297,10 @@ $('seats').addEventListener('input',event=>{
 $('seats').addEventListener('click',async event=>{
   const button=event.target.closest('button');if(!button||button.disabled)return;
   if(button.dataset.lap){
-    const ownerId=button.dataset.lap,now=performance.now();
-    if(now-(lastLap.get(ownerId)||-Infinity)<400){message('همین دور ثبت شد؛ برای ثبت دور بعد کمی مکث کن.');return;}
-    lastLap.set(ownerId,now);
-    await act({type:'lap',ownerId},'یک دور کامل ثبت شد؛ ۱۰٪ روی کارت‌های فعال آمد.');
+    const ownerId=button.dataset.lap,now=performance.now(),key=envelope.game.rules.hardcore?'all':ownerId;
+    if(now-(lastLap.get(key)||-Infinity)<400){message('همین دور ثبت شد؛ برای ثبت دور بعد کمی مکث کن.');return;}
+    lastLap.set(key,now);
+    await act({type:'lap',ownerId},envelope.game.rules.hardcore?'هاردکور: دور این بازیکن برای همهٔ بازیکنان واجد شرایط ثبت شد.':'یک دور کامل ثبت شد؛ بهرهٔ انتخابی روی کارت‌های فعال آمد.');
   }else if(button.dataset.action){
     const labels={settle:'تسویه ثبت شد و در سوابق باقی ماند.',auction:'کارت به مزایده رفت.',closeAuction:'مزایده بسته شد و سابقه باقی ماند.'};
     await act({type:button.dataset.action,cardId:button.dataset.id},labels[button.dataset.action]);
@@ -269,7 +310,7 @@ $('seats').addEventListener('change',async event=>{const cardId=event.target.dat
 $('undo').addEventListener('click',async()=>{
   if(financialBusy||failure||!envelope.undo.length)return;
   financialBusy=true;controls();
-  try{await flush();if(failure)return;const previous=envelope.undo.pop();envelope.game=previous.game;lastLap.clear();nameSession=null;dirty=true;render();await flush();if(!failure)message(`برگشت: ${previous.label}`);}
+  try{await flush();if(failure)return;const previous=envelope.undo.pop();envelope.game=previous.game;lastLap.clear();nameSession=null;rulesDraftDirty=false;dirty=true;render();await flush();if(!failure)message(`برگشت: ${previous.label}`);}
   finally{financialBusy=false;controls();}
 });
 $('retry-save').addEventListener('click',async()=>{failure=null;await flush();if(!failure)message('تغییر ذخیره شد.');});
@@ -279,7 +320,7 @@ $('reload-latest').addEventListener('click',()=>{
     financialBusy=true;controls();
     try{
       if(drainPromise)await drainPromise;
-      const latest=await store.reload();envelope=latest;persistedRevision=latest.revision;failure=null;loadFailure=false;dirty=false;nameSession=null;lastLap.clear();$('reload-latest').hidden=true;render();setStorage();message('نسخهٔ آخر دفتر خوانده شد.');
+      const latest=await store.reload();envelope=latest;persistedRevision=latest.revision;failure=null;loadFailure=false;dirty=false;nameSession=null;rulesDraftDirty=false;lastLap.clear();$('reload-latest').hidden=true;render();setStorage();message('نسخهٔ آخر دفتر خوانده شد.');
     }catch(error){message(error.message,true);}
     finally{financialBusy=false;controls();}
   };
@@ -291,7 +332,7 @@ $('archive-list').addEventListener('click',event=>{
   if(button.dataset.restoreGame!==undefined){const game=envelope.archives[Number(button.dataset.restoreGame)];confirm('بازگرداندن بازی بایگانی‌شده',`${fa(game.cards.length)} کارت بازیابی می‌شود؛ دفتر فعلی هم بایگانی خواهد شد.`,()=>replaceGame(createEnvelope(clone(game))),'بازگردان');}
 });
 window.addEventListener('beforeunload',event=>{if(dirty||failure||drainPromise){event.preventDefault();event.returnValue='';}});
-$('build-id').textContent=`نسخه ۱٫۱ · ${__BUILD_ID__}`;
+$('build-id').textContent=`نسخه ۱٫۲ · ${__BUILD_ID__}`;
 try{envelope=await store.init();persistedRevision=envelope.revision;render();setStorage();}
 catch(error){failure=error;loadFailure=true;message(`دفتر باز نشد. ${error.message} دادهٔ قبلی جایگزین نشده؛ خروجی بازیابی بگیر یا فایل سالم را بازیابی کن.`,true);setStorage();}
 if('serviceWorker' in navigator&&import.meta.env.PROD){

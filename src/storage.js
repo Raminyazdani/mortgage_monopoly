@@ -1,4 +1,5 @@
-import { SCHEMA_VERSION, createGame, validateGame, migrateLegacy, hydrateGameHistory, MAX_CARD_HISTORY } from './domain.js';
+import { SCHEMA_VERSION, createGame, validateGame, validateGameBounds, migrateLegacy, hydrateGameHistory,
+  MAX_CARD_HISTORY, MAX_LAPS } from './domain.js';
 
 export const DB_NAME = 'monopoly-mortgage-ledger-v2';
 export const STORE_NAME = 'ledger';
@@ -11,6 +12,7 @@ export const MAX_ARCHIVES = 30;
 export const MAX_TOTAL_HISTORY_EVENTS = 100_000;
 const MAX_TOTAL_CARDS = (1 + MAX_UNDO + MAX_ARCHIVES) * 500;
 const NOTIFY_KEY = 'monopoly-mortgage-ledger-notify-v2';
+const LEGACY_EVENT_TYPES = new Set(['baseline', 'created', 'lap', 'transfer', 'settle', 'auction', 'closeAuction', 'editCard']);
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const copy = value => structuredClone(value);
@@ -33,14 +35,15 @@ export class ConflictError extends StorageError {
 }
 
 export function createEnvelope(game = createGame()) {
-  validateGame(game);
-  return { schemaVersion: SCHEMA_VERSION, revision: 0, game: copy(game), undo: [], archives: [] };
+  const hydrated = hydrateGameHistory(game);
+  validateGame(hydrated);
+  return { schemaVersion: SCHEMA_VERSION, revision: 0, game: copy(hydrated), undo: [], archives: [] };
 }
 
 /** Validate every snapshot before domain arithmetic, including historical games. */
-export function validateEnvelope(envelope, { allowHistoryGap = false } = {}) {
+export function validateEnvelope(envelope, { allowHistoryGap = false, allowLegacySchema = false } = {}) {
   if (!isObject(envelope)) throw new StorageError('ساختار دفتر معتبر نیست.', 'INVALID_DATA');
-  if (envelope.schemaVersion !== SCHEMA_VERSION) {
+  if (envelope.schemaVersion !== SCHEMA_VERSION && !(allowLegacySchema && envelope.schemaVersion === 2)) {
     const message = envelope.schemaVersion > SCHEMA_VERSION
       ? 'این فایل با نسخهٔ جدیدتری ساخته شده است؛ با این نسخه قابل بازیابی نیست.'
       : 'نسخهٔ ساختار دفتر پشتیبانی نمی‌شود.';
@@ -81,14 +84,30 @@ export function validateEnvelope(envelope, { allowHistoryGap = false } = {}) {
       throw new StorageError('ساختار یا تعداد کارت‌های یکی از بازی‌ها معتبر نیست.', 'INVALID_DATA');
     }
     cards += game.cards.length;
+    if (envelope.schemaVersion === 2 ? game.rules !== undefined : !isObject(game.rules)) {
+      throw new StorageError('قواعد بهره با نسخهٔ ساختار دفتر سازگار نیست.', 'INVALID_DATA');
+    }
     for (const card of game.cards) {
       if (!isObject(card)) throw new StorageError('ساختار یکی از کارت‌ها معتبر نیست.', 'INVALID_DATA');
+      validateFinancialShape(card, envelope.schemaVersion);
       if (card.history !== undefined) {
         if (!Array.isArray(card.history) || card.history.length < 1 || card.history.length > MAX_CARD_HISTORY) {
           throw new StorageError('تاریخچهٔ کارت باید بین ۱ و ۵۰۰ رویداد داشته باشد.', 'INVALID_DATA');
         }
         historyEvents += card.history.length;
+        for (const event of card.history) {
+          if (!isObject(event)) throw new StorageError('ساختار یکی از رویدادهای کارت معتبر نیست.', 'INVALID_DATA');
+          if (envelope.schemaVersion === 2 && (!LEGACY_EVENT_TYPES.has(event.type)
+            || ['interest', 'rulesBefore', 'rulesAfter', 'triggerOwnerId', 'triggerOwnerName'].some(key => event[key] !== undefined))) {
+            throw new StorageError('رویداد بهره با نسخهٔ قدیمی دفتر سازگار نیست.', 'INVALID_DATA');
+          }
+          if (event.before !== null) validateFinancialShape(event.before, envelope.schemaVersion);
+          validateFinancialShape(event.after, envelope.schemaVersion);
+        }
       } else {
+        if (envelope.schemaVersion === SCHEMA_VERSION) {
+          throw new StorageError('تاریخچهٔ کارت در دفتر جدید باید ثبت شده باشد.', 'INVALID_DATA');
+        }
         // Reserve the baseline that normalization will add to older cards.
         historyEvents += 1;
       }
@@ -99,13 +118,8 @@ export function validateEnvelope(envelope, { allowHistoryGap = false } = {}) {
   }
   if (cards > MAX_TOTAL_CARDS) throw new StorageError('تعداد کل کارت‌ها بیش‌ازحد بزرگ است.', 'INVALID_DATA');
   for (const game of games) {
-    try { validateGame(game, { allowHistoryGap }); }
+    try { validateGameBounds(game); }
     catch (cause) { throw new StorageError(cause.message, 'INVALID_DATA', cause); }
-  }
-  for (const entry of envelope.undo) {
-    if (entry.game.id !== envelope.game.id) {
-      throw new StorageError('تاریخچه متعلق به همین بازی جاری نیست.', 'INVALID_DATA');
-    }
   }
   // Reserve more than the maximum export metadata so every accepted snapshot
   // can be exported and reimported, even with all undo/archive records present.
@@ -118,7 +132,45 @@ export function validateEnvelope(envelope, { allowHistoryGap = false } = {}) {
   if (byteLength(serialized) > MAX_IMPORT_BYTES - 1024) {
     throw new StorageError('حجم کامل دفتر بیش‌ازحد بزرگ است؛ حداکثر فایل بازیابی ۶۴ مگابایت است.', 'INVALID_DATA');
   }
+  for (const game of games) {
+    try { validateGame(game, { allowHistoryGap }); }
+    catch (cause) { throw new StorageError(cause.message, 'INVALID_DATA', cause); }
+  }
+  for (const entry of envelope.undo) {
+    if (entry.game.id !== envelope.game.id) {
+      throw new StorageError('تاریخچه متعلق به همین بازی جاری نیست.', 'INVALID_DATA');
+    }
+  }
   return envelope;
+}
+
+/** Bound every exact accrual plan in the entire envelope before arithmetic. */
+function validateFinancialShape(card, schemaVersion) {
+  if (!isObject(card)) throw new StorageError('مشخصات یکی از کارت‌ها یا رویدادها معتبر نیست.', 'INVALID_DATA');
+  if (schemaVersion === 2) {
+    if (card.accrual !== undefined) {
+      throw new StorageError('سابقهٔ بهره با نسخهٔ قدیمی دفتر سازگار نیست.', 'INVALID_DATA');
+    }
+    return;
+  }
+  if (!Array.isArray(card.accrual) || card.accrual.length > MAX_LAPS
+    || !Number.isSafeInteger(card.laps) || card.laps < 0 || card.laps > MAX_LAPS) {
+    throw new StorageError('سابقه یا تعداد دور بهره معتبر نیست.', 'INVALID_DATA');
+  }
+  let laps = 0;
+  let previous;
+  for (const segment of card.accrual) {
+    if (!isObject(segment) || !['compound', 'simple'].includes(segment.mode)
+      || !Number.isSafeInteger(segment.rateBps) || segment.rateBps < 0 || segment.rateBps > 10_000
+      || !Number.isSafeInteger(segment.laps) || segment.laps < 1 || segment.laps > MAX_LAPS
+      || (previous && previous.mode === segment.mode && previous.rateBps === segment.rateBps)) {
+      throw new StorageError('یکی از بخش‌های سابقهٔ بهره معتبر نیست.', 'INVALID_DATA');
+    }
+    laps += segment.laps;
+    if (laps > MAX_LAPS) throw new StorageError('تعداد کل دورهای سابقهٔ بهره بیش‌ازحد بزرگ است.', 'INVALID_DATA');
+    previous = segment;
+  }
+  if (laps !== card.laps) throw new StorageError('سابقهٔ بهره با تعداد دور کارت سازگار نیست.', 'INVALID_DATA');
 }
 
 function byteLength(text) {
@@ -135,9 +187,9 @@ function parseJSON(text) {
 }
 
 function normalized(envelope) {
-  // A previous app tab can still write valid card state without an event.
-  // Validate its recorded events before adding an explicit unknown-time gap.
-  validateEnvelope(envelope, { allowHistoryGap: true });
+  // Genuine schema-2 state may predate its event log. New schema-3 state must
+  // already have exact plans and a complete, consistent history.
+  validateEnvelope(envelope, { allowHistoryGap: envelope?.schemaVersion === 2, allowLegacySchema: true });
   let result;
   try {
     result = {
@@ -154,13 +206,16 @@ function normalized(envelope) {
   return copy(result);
 }
 
-function historyUpgradeNeeded(raw, candidate) {
+function upgradeNeeded(raw, candidate) {
   const rawGames = [raw.game, ...raw.undo.map(entry => entry.game), ...raw.archives];
   const nextGames = [candidate.game, ...candidate.undo.map(entry => entry.game), ...candidate.archives];
   // Export metadata and unknown envelope properties are deliberately ignored.
-  // Only changed card histories need an additive on-disk upgrade.
-  return rawGames.some((game, index) => game.cards.some((card, cardIndex) =>
-    JSON.stringify(card.history) !== JSON.stringify(nextGames[index].cards[cardIndex].history)));
+  // Persist the schema and financial rules even when the game has no cards.
+  return raw.schemaVersion !== candidate.schemaVersion || rawGames.some((game, index) =>
+    JSON.stringify(game.rules) !== JSON.stringify(nextGames[index].rules)
+    || game.cards.some((card, cardIndex) =>
+      JSON.stringify(card.accrual) !== JSON.stringify(nextGames[index].cards[cardIndex].accrual)
+      || JSON.stringify(card.history) !== JSON.stringify(nextGames[index].cards[cardIndex].history)));
 }
 
 export function parseImport(text) {
@@ -320,7 +375,7 @@ export class LedgerStore {
   async _loadNormalized(raw) {
     while (true) {
       const candidate = normalized(raw);
-      if (!historyUpgradeNeeded(raw, candidate)) return candidate;
+      if (!upgradeNeeded(raw, candidate)) return candidate;
       try {
         // Persist generated event IDs before exposing them. The existing
         // revision transaction lets only one concurrent upgrade commit.
@@ -332,7 +387,7 @@ export class LedgerStore {
         if (latestRaw === undefined) throw new StorageError('نسخهٔ ذخیره‌شده پیدا نشد.', 'MISSING');
         // Reuse the winner's actual event IDs when it completed the upgrade.
         if (latestRaw.revision === cause.latest.revision
-          && !historyUpgradeNeeded(latestRaw, cause.latest)) return cause.latest;
+          && !upgradeNeeded(latestRaw, cause.latest)) return cause.latest;
         // An older tab won with a new financial action; upgrade that version
         // instead of overwriting it with the first observed snapshot.
         raw = latestRaw;
@@ -350,7 +405,7 @@ export class LedgerStore {
       if (this._legacyRaw !== null) candidate = parseImport(this._legacyRaw);
       else candidate = createEnvelope();
       const db = await this._open();
-      let upgradedHistory = false;
+      let upgradedSnapshot = false;
       const saved = await new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
@@ -362,11 +417,11 @@ export class LedgerStore {
             if (get.result !== undefined) {
               this._raw = get.result;
               result = normalized(get.result);
-              if (historyUpgradeNeeded(get.result, result)) {
+              if (upgradeNeeded(get.result, result)) {
                 result.revision += 1;
                 validateEnvelope(result);
                 store.put(result, CURRENT_KEY);
-                upgradedHistory = true;
+                upgradedSnapshot = true;
               }
             }
             else {
@@ -380,7 +435,7 @@ export class LedgerStore {
         tx.onerror = tx.onabort = () => reject(persistenceError(failure ?? tx.error ?? get.error));
       });
       this._raw = saved;
-      if (upgradedHistory) this._announce(saved);
+      if (upgradedSnapshot) this._announce(saved);
       return this._accept(saved);
     } catch (cause) {
       this._recoverable = this._raw !== undefined || this._legacyRaw !== null;

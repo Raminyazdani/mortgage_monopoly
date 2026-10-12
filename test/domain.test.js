@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  SCHEMA_VERSION, MAX_PRICE, MAX_CARD_HISTORY, createGame, validateGame, parsePrice, calculate,
-  canLap, applyAction, migrateLegacy, hydrateGameHistory,
+  SCHEMA_VERSION, MAX_PRICE, MAX_CARD_HISTORY, MAX_LAPS, createGame, validateGame, validateGameBounds, parsePrice, parseRate, calculate,
+  canLap, canLapAll, applyAction, migrateLegacy, hydrateGameHistory,
 } from '../src/domain.js';
 
 const action = (game, type, extra = {}) => applyAction(game, { type, ...extra });
@@ -15,9 +15,22 @@ const lap = (game, ownerId = 'p1', count = 1) => {
 const roundTrip = (game) => validateGame(JSON.parse(JSON.stringify(game)));
 const legacy = (cards = [], compound = true) => ({ players: Array(8).fill(''), cards, seq: 10, compound });
 const legacyCard = (id = 'old-card', extra = {}) => ({ id, p: 0, name: 'کارت قدیمی', price: 200, laps: 0, auction: false, ...extra });
+const v2Game = (game) => {
+  const old = structuredClone(game);
+  delete old.rules;
+  for (const card of old.cards) {
+    delete card.accrual;
+    for (const event of card.history ?? []) {
+      delete event.interest;
+      if (event.before) delete event.before.accrual;
+      delete event.after.accrual;
+    }
+  }
+  return old;
+};
 
 test('schema version and exact independently specified compound debt vector', () => {
-  assert.equal(SCHEMA_VERSION, 2);
+  assert.equal(SCHEMA_VERSION, 3);
   const expected = [100, 110, 121, 133, 146, 161, 177, 195, 214];
   assert.deepEqual(expected.map((_, laps) => calculate({ price: 200, laps }).debt), expected);
   assert.notEqual(calculate({ price: 200, laps: 8 }).debt, 215);
@@ -239,7 +252,7 @@ test('legacy fixture preserves active, grace, settled, auction, IDs and unknown 
   assert.deepEqual(roundTrip(game), game);
 });
 
-test('legacy-simple stays locked, exact equality does not produce grace and new game is compound', () => {
+test('legacy-simple historical math stays intact, equality does not produce grace and new game defaults to compound', () => {
   let game = migrateLegacy(legacy([
     legacyCard('active', { laps: 10 }), legacyCard('frozen', { laps: 999, p: 1 }),
   ], false));
@@ -361,7 +374,7 @@ test('new per-card history records exact event order and immutable owner names',
   assert.equal(created.type, 'created');
   assert.equal(created.at, game.cards[0].createdAt);
   assert.equal(created.before, null);
-  assert.deepEqual(created.after, { name: 'خیابان', price: 200, laps: 0, ownerId: 'p1',
+  assert.deepEqual(created.after, { name: 'خیابان', price: 200, laps: 0, accrual: [], ownerId: 'p1',
     ownerName: 'رامین', status: 'active', debt: 100, paid: null });
   game = lap(game, 'p1', 2);
   game = action(game, 'rename', { ownerId: 'p1', name: 'نام تازه' });
@@ -395,7 +408,7 @@ test('one lap yields independent card events with the same action timestamp and 
 });
 
 test('old v2 history hydration is immutable and idempotent with only a known-state baseline', () => {
-  const original = lap(add(createGame(['رامین'])), 'p1', 2);
+  const original = v2Game(lap(add(createGame(['رامین'])), 'p1', 2));
   delete original.cards[0].history;
   const before = structuredClone(original);
   assert.equal(validateGame(original), original);
@@ -406,7 +419,7 @@ test('old v2 history hydration is immutable and idempotent with only a known-sta
   assert.equal(event.type, 'baseline');
   assert.equal(event.at, null);
   assert.equal(event.before, null);
-  assert.deepEqual(event.after, { name: 'خیابان', price: 200, laps: 2, ownerId: 'p1',
+  assert.deepEqual(event.after, { name: 'خیابان', price: 200, laps: 2, accrual: [{ mode: 'compound', rateBps: 1000, laps: 2 }], ownerId: 'p1',
     ownerName: 'رامین', status: 'active', debt: 121, paid: null });
   assert.equal(hydrated.cards[0].history.length, 1);
   assert.equal(hydrateGameHistory(hydrated), hydrated);
@@ -417,8 +430,8 @@ test('old v2 history hydration is immutable and idempotent with only a known-sta
 });
 
 test('changes carried forward by an old tab add a dated-unknown baseline gap and retain known prior events', () => {
-  const oldTab = lap(add(createGame(['رامین', 'سارا'])), 'p1', 2);
-  const previousEvents = structuredClone(oldTab.cards[0].history);
+  const oldTab = v2Game(lap(add(createGame(['رامین', 'سارا'])), 'p1', 2));
+  const previousEvents = structuredClone(hydrateGameHistory(oldTab).cards[0].history);
   oldTab.cards[0].ownerId = 'p2';
   oldTab.cards[0].laps = 3;
   const before = structuredClone(oldTab);
@@ -635,4 +648,353 @@ test('full history rejects the next action atomically without dropping old event
   const oversized = structuredClone(original);
   oversized.cards[1].history.push(structuredClone(full.history.at(-1)));
   assert.throws(() => validateGame(oversized));
+});
+
+test('rates parse exact hundredths of a percent in Latin, Persian and Arabic digits', () => {
+  for (const [text, rate] of [['0', 0], ['۰', 0], ['۱۰', 1000], ['٠٫٠١', 1], ['12.5', 1250],
+    [' ۱۲٫۵۰ ', 1250], ['100.00', 10000], ['۹۹٫۹۹', 9999], ['00.25', 25]]) {
+    assert.equal(parseRate(text), rate, text);
+  }
+  for (const text of ['', '-1', '+1', '100.01', '۱۰۱', '1,5', '۱٬۵', '.5', '5.', '1.001',
+    'NaN', 'Infinity', '1e1', '1/2', '1 0', '1\n0', '1..5', '۱٫۲.۳', '<b>1</b>']) {
+    assert.throws(() => parseRate(text), undefined, text);
+  }
+  assert.throws(() => parseRate(10));
+});
+
+test('rules changes preserve exact existing debt and only affect future laps', () => {
+  let game = lap(add(createGame()), 'p1', 2);
+  const original = structuredClone(game);
+  game = action(game, 'setRules', { rules: { compoundRateBps: 2000 } });
+  assert.equal(calculate(game.cards[0], game.model, game.rules).debt, 121);
+  assert.equal(game.cards[0].laps, 2);
+  assert.deepEqual(game.cards[0].accrual, [{ mode: 'compound', rateBps: 1000, laps: 2 }]);
+  assert.equal(game.model, 'compound');
+  assert.deepEqual(original.cards[0].history.map((event) => event.type), ['created', 'lap', 'lap']);
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 145); // exact 145.2
+  game = action(game, 'setRules', { rules: { mode: 'simple', simpleRateBps: 500 } });
+  assert.equal(calculate(game.cards[0]).debt, 145);
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 150); // exact 150.2
+  assert.deepEqual(game.cards[0].accrual, [
+    { mode: 'compound', rateBps: 1000, laps: 2 },
+    { mode: 'compound', rateBps: 2000, laps: 1 },
+    { mode: 'simple', rateBps: 500, laps: 1 },
+  ]);
+  const events = game.cards[0].history;
+  assert.deepEqual(events.map((event) => event.type), ['created', 'lap', 'lap', 'rulesChanged', 'lap', 'rulesChanged', 'lap']);
+  assert.deepEqual(events[3].before, events[3].after);
+  assert.equal(events[3].rulesBefore.compoundRateBps, 1000);
+  assert.equal(events[3].rulesAfter.compoundRateBps, 2000);
+  assert.deepEqual(events[4].interest, { mode: 'compound', rateBps: 2000 });
+  assert.deepEqual(events[6].interest, { mode: 'simple', rateBps: 500 });
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('switching to simple interest uses the original loan and switching back compounds accumulated exact debt', () => {
+  let game = lap(add(createGame()), 'p1', 2);
+  game = action(game, 'setRules', { rules: { mode: 'simple' } });
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 131); // 121 + 10, rather than 133.1
+  game = action(game, 'setRules', { rules: { mode: 'compound' } });
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 144); // exact 144.1
+  assert.deepEqual(game.cards[0].accrual, [{ mode: 'compound', rateBps: 1000, laps: 2 },
+    { mode: 'simple', rateBps: 1000, laps: 1 }, { mode: 'compound', rateBps: 1000, laps: 1 }]);
+});
+
+test('successive equal rules compress and odd-price fractional precision survives rule switches', () => {
+  let game = lap(add(createGame(), 'p1', 201), 'p1', 2); // exact 121.605
+  game = action(game, 'setRules', { rules: { mode: 'simple', simpleRateBps: 25 } });
+  game = lap(game, 'p1', 2); // 121.605 + 0.25125 + 0.25125 = 122.1075
+  assert.equal(calculate(game.cards[0]).debt, 122);
+  assert.deepEqual(game.cards[0].accrual, [{ mode: 'compound', rateBps: 1000, laps: 2 },
+    { mode: 'simple', rateBps: 25, laps: 2 }]);
+  game = action(game, 'setRules', { rules: { mode: 'compound', compoundRateBps: 1250 } });
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 137); // exact 137.3709375
+});
+
+test('future crossing forecasts follow live settings while the historical exact debt stays fixed', () => {
+  let game = lap(add(createGame()), 'p1', 7); // exact 194.87171
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, true);
+  game = action(game, 'setRules', { rules: { compoundRateBps: 0 } });
+  const current = calculate(game.cards[0], game.model, game.rules);
+  assert.equal(current.debt, 195);
+  assert.equal(current.nextOver, false);
+  game = lap(game);
+  assert.equal(game.cards[0].laps, 8);
+  assert.equal(game.cards[0].status, 'active');
+  assert.equal(calculate(game.cards[0]).debt, 195);
+  game = action(game, 'setRules', { rules: { mode: 'simple', simpleRateBps: 500 } });
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, false); // 199.87171
+  game = lap(game);
+  assert.equal(game.cards[0].status, 'active');
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, true);
+  game = lap(game);
+  assert.equal(game.cards[0].status, 'grace');
+  assert.equal(calculate(game.cards[0]).debt, 205);
+});
+
+test('zero rates permit more than eleven laps and freeze no financial value; configured limits remain bounded', () => {
+  for (const mode of ['compound', 'simple']) {
+    const rules = { mode, compoundRateBps: 0, simpleRateBps: 0, hardcore: false };
+    let game = lap(add(createGame([], rules)), 'p1', 30);
+    assert.equal(game.cards[0].laps, 30);
+    assert.equal(game.cards[0].status, 'active');
+    assert.equal(calculate(game.cards[0], game.model, game.rules).debt, 100);
+    assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, false);
+    assert.deepEqual(game.cards[0].accrual, [{ mode, rateBps: 0, laps: 30 }]);
+    assert.deepEqual(roundTrip(game), game);
+    const limited = { price: 200, laps: MAX_LAPS, accrual: [{ mode, rateBps: 0, laps: MAX_LAPS }] };
+    assert.equal(calculate(limited, game.model, game.rules).debt, 100);
+    assert.throws(() => calculate({ ...limited, laps: MAX_LAPS + 1 }));
+    game = action(game, 'setRules', { rules: { compoundRateBps: 10000, simpleRateBps: 10000 } });
+    game = lap(game);
+    assert.equal(game.cards[0].status, 'active');
+    assert.equal(calculate(game.cards[0]).debt, 200);
+  }
+});
+
+test('100 percent compound rate honors exact equality then first crossing and maximum safe debt', () => {
+  let game = add(createGame([], { mode: 'compound', compoundRateBps: 10000, simpleRateBps: 10000, hardcore: false }), 'p1', MAX_PRICE);
+  game = lap(game);
+  assert.equal(game.cards[0].status, 'active');
+  assert.equal(calculate(game.cards[0], game.model, game.rules).debt, MAX_PRICE);
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, true);
+  game = lap(game);
+  assert.equal(game.cards[0].status, 'grace');
+  assert.equal(calculate(game.cards[0], game.model, game.rules).debt, MAX_PRICE * 2);
+  assert.equal(lap(game), game);
+  assert.deepEqual(roundTrip(game), game);
+  const wrong = structuredClone(game);
+  wrong.cards[0].laps = 3;
+  wrong.cards[0].accrual[0].laps = 3;
+  delete wrong.cards[0].history;
+  assert.throws(() => validateGame(wrong), /اولین/);
+});
+
+test('price correction replays original mixed interest rules and preserves paid settlement', () => {
+  let game = lap(add(createGame()), 'p1', 2);
+  game = action(game, 'setRules', { rules: { compoundRateBps: 2000 } });
+  game = lap(game);
+  game = action(game, 'setRules', { rules: { mode: 'simple', simpleRateBps: 500 } });
+  game = lap(game);
+  const beforePlan = structuredClone(game.cards[0].accrual);
+  const cardId = game.cards[0].id;
+  game = action(game, 'settle', { cardId });
+  const settlement = structuredClone(game.cards[0].settlement);
+  game = action(game, 'editCard', { cardId, name: 'اصلاح', price: 300 });
+  assert.equal(game.cards[0].laps, 4);
+  assert.equal(calculate(game.cards[0]).debt, 225); // exact 225.3
+  assert.deepEqual(game.cards[0].accrual, beforePlan);
+  assert.deepEqual(game.cards[0].settlement, settlement);
+  assert.equal(settlement.amount, 150);
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('rule changes leave all frozen cards untouched and no-op changes add no events', () => {
+  let game = lap(add(createGame()), 'p1', 8);
+  game = add(game, 'p2', 150);
+  game = action(game, 'settle', { cardId: game.cards[1].id });
+  game = add(game, 'p3', 300);
+  const frozen = structuredClone(game.cards.slice(0, 2));
+  const oldRules = structuredClone(game.rules);
+  assert.equal(action(game, 'setRules', { rules: oldRules }), game);
+  assert.equal(action(game, 'setRules', { rules: {} }), game);
+  game = action(game, 'setRules', { rules: { mode: 'simple', compoundRateBps: 500, simpleRateBps: 1250, hardcore: true } });
+  assert.deepEqual(game.cards.slice(0, 2), frozen);
+  assert.equal(game.cards[2].history.at(-1).type, 'rulesChanged');
+  assert.deepEqual(game.cards[2].history.at(-1).before, game.cards[2].history.at(-1).after);
+  assert.deepEqual(game.cards[2].history.at(-1).rulesBefore, oldRules);
+});
+
+test('collective lap advances every eligible active card atomically and skips grace owners and frozen cards', () => {
+  let game = lap(add(createGame()), 'p1', 8);
+  game = add(game, 'p1', 300, 'blocked sibling');
+  game = add(add(add(game, 'p2', 150, 'eligible'), 'p3', 201, 'also eligible'), 'p4', 300, 'paid');
+  game = action(game, 'settle', { cardId: game.cards[4].id });
+  const before = structuredClone(game);
+  assert.equal(canLapAll(game), true);
+  game = action(game, 'lapAll');
+  assert.deepEqual(game.cards.map((card) => card.laps), [8, 0, 1, 1, 0]);
+  assert.deepEqual(game.cards.slice(0, 2), before.cards.slice(0, 2));
+  assert.deepEqual(game.cards[4], before.cards[4]);
+  for (const card of game.cards.slice(2, 4)) {
+    const event = card.history.at(-1);
+    assert.equal(event.type, 'lapAll');
+    assert.equal(event.triggerOwnerId, null);
+    assert.equal(event.triggerOwnerName, null);
+    assert.deepEqual(event.interest, { mode: 'compound', rateBps: 1000 });
+  }
+  assert.equal(game.cards[2].history.at(-1).at, game.cards[3].history.at(-1).at);
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('collective first crossings remain independent and all affected cards cross in one action', () => {
+  let game = add(add(add(createGame()), 'p1', 201, 'sibling'), 'p2', 300, 'other owner');
+  for (let index = 0; index < 7; index += 1) game = action(game, 'lapAll');
+  game = action(game, 'lapAll');
+  assert.deepEqual(game.cards.map((card) => card.status), ['grace', 'grace', 'grace']);
+  assert.deepEqual(game.cards.map((card) => card.laps), [8, 8, 8]);
+  assert.equal(canLapAll(game), false);
+  assert.equal(action(game, 'lapAll'), game);
+  game = action(game, 'settle', { cardId: game.cards[0].id });
+  assert.deepEqual(game.cards.map((card) => card.status), ['settled', 'grace', 'grace']);
+  assert.equal(canLapAll(game), false);
+});
+
+test('hardcore physical laps can be triggered by an empty seat and retain event-time trigger names', () => {
+  let game = add(add(createGame(['رامین', 'سارا']), 'p1'), 'p2', 150);
+  assert.equal(canLap(game, 'p8'), false);
+  game = action(game, 'setRules', { rules: { hardcore: true } });
+  assert.equal(canLap(game, 'p8'), true);
+  assert.equal(canLap(game, 'invalid'), false);
+  game = lap(game, 'p1');
+  assert.deepEqual(game.cards.map((card) => card.laps), [1, 1]);
+  assert.equal(game.cards[0].history.at(-1).triggerOwnerId, 'p1');
+  assert.equal(game.cards[1].history.at(-1).triggerOwnerName, 'رامین');
+  game = action(game, 'rename', { ownerId: 'p1', name: 'نام جدید' });
+  assert.equal(game.cards[1].history.at(-1).triggerOwnerName, 'رامین');
+  game = lap(game, 'p8');
+  assert.deepEqual(game.cards.map((card) => card.laps), [2, 2]);
+  assert.equal(game.cards[0].history.at(-1).triggerOwnerId, 'p8');
+  game = action(game, 'setRules', { rules: { hardcore: false } });
+  assert.equal(canLap(game, 'p8'), false);
+  game = lap(game, 'p1');
+  assert.deepEqual(game.cards.map((card) => card.laps), [3, 2]);
+});
+
+test('hardcore grace trigger is blocked but another player advances all other eligible owners', () => {
+  let game = lap(add(createGame()), 'p1', 8);
+  game = add(add(game, 'p1', 300), 'p2', 150);
+  game = action(game, 'setRules', { rules: { hardcore: true } });
+  assert.equal(canLap(game, 'p1'), false);
+  assert.equal(lap(game, 'p1'), game);
+  assert.equal(canLap(game, 'p2'), true);
+  game = lap(game, 'p2');
+  assert.deepEqual(game.cards.map((card) => card.laps), [8, 0, 1]);
+  assert.equal(game.cards[2].history.at(-1).triggerOwnerId, 'p2');
+});
+
+test('rules and collective action snapshots allow complete undo with the original exact plans and logs', () => {
+  let game = add(add(createGame()), 'p2', 201);
+  const beforeRules = structuredClone(game);
+  game = action(game, 'setRules', { rules: { compoundRateBps: 1250, simpleRateBps: 300, hardcore: true } });
+  const beforeLap = structuredClone(game);
+  game = lap(game, 'p8');
+  assert.deepEqual(game.cards.map((card) => card.laps), [1, 1]);
+  game = roundTrip(beforeLap);
+  assert.deepEqual(game.cards.map((card) => card.laps), [0, 0]);
+  assert.equal(game.rules.hardcore, true);
+  assert.ok(game.cards.every((card) => card.history.at(-1).type === 'rulesChanged'));
+  game = roundTrip(beforeRules);
+  assert.equal(game.rules.compoundRateBps, 1000);
+  assert.equal(game.rules.hardcore, false);
+  assert.ok(game.cards.every((card) => card.history.length === 1));
+});
+
+test('new game can preserve chosen rules independently of the source configuration', () => {
+  const rules = { mode: 'simple', compoundRateBps: 1500, simpleRateBps: 750, hardcore: true };
+  const game = createGame(['رامین'], rules);
+  assert.deepEqual(game.rules, rules);
+  rules.simpleRateBps = 0;
+  assert.equal(game.rules.simpleRateBps, 750);
+  assert.deepEqual(createGame().rules, { mode: 'compound', compoundRateBps: 1000, simpleRateBps: 1000, hardcore: false });
+});
+
+test('v2 hydration preserves exact paid values, old IDs, names, timestamps, and both historical 10 percent models', () => {
+  for (const compound of [true, false]) {
+    const historical = v2Game(migrateLegacy(legacy([legacyCard('odd', { price: 201, laps: 2, paid: 119 })], compound)));
+    const before = JSON.stringify(historical);
+    const oldEvent = structuredClone(historical.cards[0].history[0]);
+    const hydrated = hydrateGameHistory(historical);
+    assert.equal(JSON.stringify(historical), before);
+    assert.equal(hydrated.rules.mode, compound ? 'compound' : 'simple');
+    assert.deepEqual(hydrated.cards[0].accrual, [{ mode: compound ? 'compound' : 'simple', rateBps: 1000, laps: 2 }]);
+    assert.equal(calculate(hydrated.cards[0], hydrated.model).debt, compound ? 122 : 121);
+    assert.equal(hydrated.cards[0].settlement.amount, 119);
+    assert.equal(hydrated.cards[0].history[0].id, oldEvent.id);
+    assert.equal(hydrated.cards[0].history[0].at, oldEvent.at);
+    assert.equal(hydrated.cards[0].history[0].after.ownerName, oldEvent.after.ownerName);
+    assert.equal(hydrateGameHistory(hydrated), hydrated);
+  }
+  let game = v2Game(lap(add(createGame(['رامین'])), 'p1', 2));
+  const oldLog = structuredClone(game.cards[0].history);
+  game = hydrateGameHistory(game);
+  assert.deepEqual(game.cards[0].history.map((event) => [event.id, event.at]), oldLog.map((event) => [event.id, event.at]));
+  assert.deepEqual(game.cards[0].history[2].interest, { mode: 'compound', rateBps: 1000 });
+  game = action(game, 'setRules', { rules: { compoundRateBps: 2000 } });
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 145);
+});
+
+test('malformed rules, hostile accrual bounds and fabricated financial history reject without mutation', () => {
+  const original = lap(add(createGame()), 'p1', 2);
+  const reject = (mutate) => {
+    const game = structuredClone(original);
+    mutate(game);
+    const before = JSON.stringify(game);
+    assert.throws(() => validateGame(game));
+    assert.equal(JSON.stringify(game), before);
+  };
+  for (const rules of [null, {}, { ...original.rules, mode: 'legacy-simple' }, { ...original.rules, hardcore: 1 },
+    { ...original.rules, compoundRateBps: 10001 }, { ...original.rules, simpleRateBps: -1 },
+    { ...original.rules, compoundRateBps: 0.1 }, { ...original.rules, simpleRateBps: '1000' }]) {
+    reject((game) => { game.rules = rules; });
+    if (rules === null || Object.keys(rules).length) assert.throws(() => action(original, 'setRules', { rules }));
+  }
+  for (const accrual of [null, [], [{ mode: 'flat', rateBps: 1000, laps: 2 }],
+    [{ mode: 'compound', rateBps: 1000, laps: 1_000_000 }], [{ mode: 'compound', rateBps: 1000, laps: 1 }],
+    [{ mode: 'compound', rateBps: 10001, laps: 2 }], [{ mode: 'compound', rateBps: 1000, laps: 0 }],
+    [{ mode: 'compound', rateBps: 1000, laps: 1 }, { mode: 'compound', rateBps: 1000, laps: 1 }]]) {
+    reject((game) => { game.cards[0].accrual = accrual; });
+    assert.throws(() => calculate({ price: 200, laps: 2, accrual }));
+  }
+  reject((game) => { game.cards[0].history[1].interest.rateBps = 2000; });
+  reject((game) => { delete game.cards[0].history[1].interest; });
+  reject((game) => { game.cards[0].history[1].after.accrual[0].rateBps = 2000; });
+  reject((game) => { game.cards[0].history[1].after.accrual[0].laps = 1_000_000; });
+  const changed = action(original, 'setRules', { rules: { mode: 'simple' } });
+  const forged = structuredClone(changed);
+  forged.cards[0].history.at(-1).rulesAfter = forged.cards[0].history.at(-1).rulesBefore;
+  assert.throws(() => validateGame(forged));
+  const collective = action(original, 'lapAll');
+  collective.cards[0].history.at(-1).triggerOwnerId = 'p9';
+  assert.throws(() => validateGame(collective));
+});
+
+test('a full history blocks rules changes and collective lap atomically', () => {
+  let game = add(add(createGame()), 'p2', 200, 'full');
+  const full = game.cards[1];
+  for (let index = 1; index < MAX_CARD_HISTORY; index += 1) {
+    const before = structuredClone(full.history.at(-1).after);
+    const after = { ...before, name: `full-${index}` };
+    full.history.push({ id: `edit-${index}`, type: 'editCard', at: full.createdAt, before, after });
+    full.name = after.name;
+  }
+  const before = JSON.stringify(game);
+  assert.equal(validateGameBounds(game), game);
+  assert.throws(() => action(game, 'lapAll'), /۵۰۰/);
+  assert.throws(() => action(game, 'setRules', { rules: { compoundRateBps: 2000 } }), /۵۰۰/);
+  assert.equal(JSON.stringify(game), before);
+  assert.equal(game.cards[0].laps, 0);
+  assert.equal(game.rules.compoundRateBps, 1000);
+});
+
+test('the lap bound refuses a collective action atomically instead of silently skipping a capped active card', () => {
+  const rules = { mode: 'compound', compoundRateBps: 0, simpleRateBps: 0, hardcore: false };
+  let game = add(add(createGame([], rules)), 'p2', 150);
+  const capped = game.cards[0];
+  capped.laps = MAX_LAPS;
+  capped.accrual = [{ mode: 'compound', rateBps: 0, laps: MAX_LAPS }];
+  delete capped.history;
+  game = hydrateGameHistory(game);
+  const before = JSON.stringify(game);
+  assert.equal(canLapAll(game), true);
+  assert.throws(() => action(game, 'lapAll'), /۵۰۰ دور/);
+  assert.throws(() => lap(game, 'p1'), /۵۰۰ دور/);
+  assert.equal(JSON.stringify(game), before);
+  assert.equal(game.cards[1].laps, 0);
 });

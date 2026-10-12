@@ -16,11 +16,23 @@
         <button id="undo" class="button secondary" disabled>↶ برگردون</button>
       </header>
       <section class="intro" aria-label="قانون بازی">
-        <div><strong>نصفِ قیمت را بگیر، دورها را ثبت کن.</strong><p>هر دور کامل، ۱۰٪ روی بدهی همان لحظه. بعد از عبور از قیمت کارت، یک شانس تسویه.</p></div>
-        <span class="rule-badge">۱۰٪<small>بهرهٔ مرکب</small></span>
+        <div><strong>نصفِ قیمت را بگیر، دورها را ثبت کن.</strong><p id="active-rule">هر دور کامل، ۱۰٪ روی بدهی همان لحظه. بعد از عبور از قیمت کارت، یک شانس تسویه.</p></div>
+        <span class="rule-badge"><span id="active-rate">۱۰٪</span><small id="active-mode">بهرهٔ مرکب</small></span>
       </section>
       <div class="save-line"><span id="storage-status" role="status">در حال بازکردن دفتر…</span><div><button id="retry-save" class="text-button" hidden>دوباره ذخیره کن</button><button id="reload-latest" class="text-button" hidden>خواندن نسخهٔ آخر</button></div></div>
       <p id="message" role="status" aria-live="polite" hidden></p>
+      <details class="fold interest-settings" id="interest-settings" open>
+        <summary>بهره و هاردکور <span id="rules-summary"></span></summary>
+        <form id="rules-form" novalidate>
+          <label for="interest-mode">نوع بهره<select id="interest-mode"><option value="compound">مرکب · روی بدهی فعلی</option><option value="simple">ساده · روی مبلغ اولیهٔ مورگیج</option></select></label>
+          <label for="compound-rate">نرخ مرکب در هر دور (%)<input id="compound-rate" inputmode="decimal" maxlength="8" autocomplete="off" value="10" /></label>
+          <label for="simple-rate">نرخ ساده در هر دور (%)<input id="simple-rate" inputmode="decimal" maxlength="8" autocomplete="off" value="10" /></label>
+          <label class="hardcore-choice" for="hardcore"><input id="hardcore" type="checkbox" /><span>هاردکور: با «دور زد» هر نفر، برای همه یک دور ثبت شود.</span></label>
+          <button id="save-rules" class="button primary" type="submit">اعمال از دور بعد</button>
+          <p id="rules-note">بدهی فعلی حفظ می‌شود. تنظیم جدید فقط برای دورهای بعد است. نرخ از ۰ تا ۱۰۰ درصد، با حداکثر دو رقم اعشار.</p>
+          <p id="rules-error" role="alert" hidden></p>
+        </form>
+      </details>
       <form id="add" class="add-panel" novalidate>
         <div class="form-heading"><h2>یک کارت تازه</h2><span>مورگیج = نصف قیمت</span></div>
         <label for="who">کارت مالِ کیه؟<select id="who" required></select></label>
@@ -29,7 +41,8 @@
         <button type="submit" class="button primary">بذار مورگیج</button>
         <small id="price-hint">عدد صحیح از ۱ تا ۹٬۹۹۹٬۹۹۹٬۹۹۹ · ارقام فارسی، عربی و لاتین پذیرفته می‌شوند.</small>
       </form>
-      <div class="section-heading"><h2>دورِ میز</h2><span id="summary">۸ جایگاه بازیکن</span></div>
+      <div class="section-heading"><h2>دورِ میز</h2><div class="table-actions"><span id="summary">۸ جایگاه بازیکن</span><button id="lap-all" class="button secondary" disabled>+ یک دور برای همه</button></div></div>
+      <p id="global-note" class="global-note">دور جمعی فقط به کارت‌های فعالِ بازیکنانی اضافه می‌شود که آخرین شانسِ حل‌نشده ندارند.</p>
       <main id="seats" class="seats" aria-label="بازیکن‌ها و کارت‌ها"></main>
       <details class="fold" id="history"><summary>سوابق این بازی <span id="history-count"></span></summary><div id="history-list" class="history-list"></div></details>
       <section class="bottom-panel" aria-label="پشتیبان و بازی جدید">
@@ -38,8 +51,9 @@
       </section>
       <details class="fold" id="archives"><summary>بازی‌های بایگانی‌شده <span id="archive-count"></span></summary><div id="archive-list" class="history-list"></div></details>
       <details class="fold guide"><summary>راهنمای کوتاه و قواعد دقیق</summary><div>
-        <p>«دور زد» را فقط وقتی بزن که همان بازیکن یک دور کامل روی صفحهٔ بازی زده؛ هر نوبت بازی یک دور نیست. فقط کارت‌های فعال او بهره می‌گیرند. تا تعیین تکلیف همهٔ کارت‌های «آخرین شانس»، دور تازهٔ آن بازیکن ثبت نمی‌شود.</p>
-        <p>بهره روی مقدار دقیق انباشته حساب می‌شود و فقط مبلغ نهایی گرد می‌شود؛ نصف‌ها به بالا. کارت ۲۰۰: ۱۰۰، ۱۱۰، ۱۲۱، ۱۳۳، ۱۴۶، ۱۶۱، ۱۷۷، ۱۹۵ و ۲۱۴. آخرین شانس با عبور دقیق از قیمت شروع می‌شود؛ زمان‌سنج ندارد و بدهی ثابت می‌ماند.</p>
+        <p>در حالت معمول، «دور زد» را برای یک دور کامل همان بازیکن روی صفحهٔ بازی بزن؛ هر نوبت بازی یک دور نیست. با دکمهٔ «یک دور برای همه» کارت‌های فعالِ همهٔ بازیکنان واجد شرایط بهره می‌گیرند. در هاردکور، «دور زد» هر نفر همین اثر جمعی را دارد. صاحبِ آخرین شانسِ حل‌نشده، حتی در دور جمعی، بهرهٔ تازه نمی‌گیرد؛ بقیه می‌توانند ادامه بدهند.</p>
+        <p>مرکب، درصدی از بدهی دقیق فعلی را اضافه می‌کند؛ ساده، درصدی از مبلغ دقیق اولیهٔ مورگیج را. درصد هر کدام جداگانه از ۰ تا ۱۰۰، با دو رقم اعشار قابل تنظیم است. «اعمال از دور بعد» بدهی فعلی را تغییر نمی‌دهد؛ نرخ و نوع قبلی در تاریخچهٔ دورهای گذشته حفظ می‌شوند.</p>
+        <p>اعشار فقط در مبلغ نهایی گرد می‌شود و نیمه‌ها به بالا هستند. با نرخ مرکب ۱۰٪، کارت ۲۰۰: ۱۰۰، ۱۱۰، ۱۲۱، ۱۳۳، ۱۴۶، ۱۶۱، ۱۷۷، ۱۹۵ و ۲۱۴. با نرخ ساده ۱۰٪: ۱۰۰، ۱۱۰، ۱۲۰ و همین‌طور. آخرین شانس با عبور دقیق از قیمت شروع می‌شود؛ زمان‌سنج ندارد و بهره و دور آن متوقف می‌شوند. نرخ انتخابی، تعداد دور رسیدن به سقف را عوض می‌کند.</p>
         <p>قیمت فرد هم از نصف دقیق شروع می‌شود: کارت ۲۰۱، دریافت نمایشی ۱۰۱، دور اول ۱۱۱. مزایده از یک‌چهارم قیمت با همان گردکردن شروع می‌شود؛ ۱۵۰ ← ۳۸، ۲۰۱ ← ۵۰، ۲۰۲ ← ۵۱. انتقال بهره یا کارمزد ندارد. تسویه فقط کامل است.</p>
         <p>«برگردون» تا ۵۰ اقدام را حتی پس از بستن صفحه برمی‌گرداند. تسویه‌ها و مزایده‌های بسته در سوابق می‌مانند. پیش از بازی جدید یا بازیابی، دفتر فعلی بایگانی می‌شود.</p>
         <p>در «تاریخچهٔ کارت»، ثبت، دور، انتقال، تسویه و مزایده را با مبلغ همان لحظه می‌بینی. «اصلاح اسم و قیمت» تعداد دورها را حفظ می‌کند و بدهی را با قیمت درست دوباره حساب می‌کند؛ مبلغ تسویهٔ قبلاً ثبت‌شده تغییر نمی‌کند. هر اصلاح یک اقدام قابل برگشت است. برای کارت‌های قبلی، تاریخچه از وضعیت موجود شروع می‌شود و اتفاقات ثبت‌نشدهٔ گذشته ساخته نمی‌شوند.</p>

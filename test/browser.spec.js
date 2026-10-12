@@ -170,6 +170,33 @@ async function replaceStoredLedger(page, value) {
   await expect(page.locator('#add button')).toBeEnabled();
 }
 
+async function openRules(page) {
+  await page.locator('#rules-form').evaluate((element) => {
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      if (parent.tagName === 'DETAILS') parent.open = true;
+    }
+  });
+  await expect(page.locator('#rules-form')).toBeVisible();
+}
+
+async function saveRules(page, { mode = 'compound', compoundRate = '10', simpleRate = '10', hardcore = false }) {
+  await openRules(page);
+  await page.locator('#interest-mode').selectOption(mode);
+  await page.locator('#compound-rate').fill(String(compoundRate));
+  await page.locator('#simple-rate').fill(String(simpleRate));
+  await page.locator('#hardcore').setChecked(hardcore);
+  const revision = (await ledger(page)).revision;
+  await page.locator('#save-rules').click();
+  await persisted(page, (data) => data.revision > revision);
+}
+
+async function lapAll(page) {
+  await page.waitForTimeout(430);
+  const revision = (await ledger(page)).revision;
+  await page.locator('#lap-all').click();
+  await persisted(page, (data) => data.revision > revision);
+}
+
 test('exact compound vector and only the owner’s active cards accrue interest', async ({ page }) => {
   await open(page);
   const first = await addCard(page, 'p1', 'خیابان اول', '۲۰۰');
@@ -350,7 +377,7 @@ test('export downloads a complete backup, new game archives, import restores and
   const id = await addCard(page, 'p1', 'نسخهٔ پشتیبان', '۲٬۰۰۰');
   await lap(page);
   const backup = await exportFile(page);
-  expect(backup.schemaVersion).toBe(2);
+  expect(backup.schemaVersion).toBe(3);
   expect(backup.exportId).toBeTruthy();
   expect(backup.exportedAt).toBeTruthy();
   expect(backup.game.cards.find((item) => item.id === id).laps).toBe(1);
@@ -431,6 +458,7 @@ test('legacy-simple equality is active at ten laps and strict crossing is grace 
   await page.locator('#reset').click();
   await confirm(page);
   await persisted(page, (data) => data.game.model === 'compound');
+  expect((await ledger(page)).game.rules).toEqual({ mode: 'simple', compoundRateBps: 1000, simpleRateBps: 1000, hardcore: false });
 });
 
 test('invalid backups and price inputs never alter the healthy game', async ({ page }) => {
@@ -439,7 +467,7 @@ test('invalid backups and price inputs never alter the healthy game', async ({ p
   const snapshot = structuredClone((await ledger(page)).game);
   const badImports = [
     '{broken JSON',
-    { schemaVersion: 999, game: snapshot },
+    { schemaVersion: 4, game: snapshot },
     legacy([{ id: 'wrong-owner', p: 9, name: 'نامعتبر', price: 200, laps: 0, auction: false }]),
     legacy([{ id: 'same', p: 0, name: 'اول', price: 200, laps: 0, auction: false }, { id: 'same', p: 1, name: 'دوم', price: 200, laps: 0, auction: false }]),
     legacy([{ id: 'huge', p: 0, name: 'بیش از سقف', price: 10_000_000_000, laps: 0, auction: false }]),
@@ -860,7 +888,12 @@ test('a v2 ledger without events gains one honest baseline and retains all 50 un
   await lap(page);
   await lap(page);
   const old = await ledger(page);
-  for (const item of old.game.cards) delete item.history;
+  old.schemaVersion = 2;
+  delete old.game.rules;
+  for (const item of old.game.cards) {
+    delete item.history;
+    delete item.accrual;
+  }
   const financial = structuredClone(old.game.cards[0]);
   old.revision = 80;
   old.undo = Array.from({ length: 50 }, (_, index) => {
@@ -884,7 +917,7 @@ test('a v2 ledger without events gains one honest baseline and retains all 50 un
   expect((await ledger(page)).undo).toHaveLength(50);
   await undo(page);
   const restored = (await ledger(page)).game.cards.find((item) => item.id === id);
-  const { history, ...restoredFinancial } = restored;
+  const { history, accrual, ...restoredFinancial } = restored;
   expect(restoredFinancial).toEqual(financial);
   await showCardHistory(page, id);
   await expect(eventOf(page, id, 'baseline')).toHaveCount(1);
@@ -943,6 +976,336 @@ test('mobile history and correction dialog fit 360px and render edited HTML lite
   await expect(eventOf(page, id, 'editCard')).toContainText(unsafe);
   await expect(card(page, id).locator('img')).toHaveCount(0);
   expect(await page.evaluate(() => window.cardEditInjected)).toBeUndefined();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(errors).toEqual([]);
+});
+
+test('mixed future interest settings preserve debt, replay historical rates on correction and survive backup', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'بهره با چند نرخ');
+  await lap(page);
+  await lap(page);
+  await debt(page, id, 121);
+  await saveRules(page, { compoundRate: '20', simpleRate: '5' });
+  await debt(page, id, 121);
+  expect((await ledger(page)).game.cards.find((item) => item.id === id).laps).toBe(2);
+  await lap(page);
+  await debt(page, id, 145);
+  await saveRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5' });
+  await debt(page, id, 145);
+  await lap(page);
+  await debt(page, id, 150);
+  const mixed = await ledger(page);
+  expect(mixed.game.rules).toEqual({ mode: 'simple', compoundRateBps: 2000, simpleRateBps: 500, hardcore: false });
+  const history = mixed.game.cards.find((item) => item.id === id).history;
+  expect(history.filter((event) => event.type === 'lap').map((event) => event.interest)).toEqual([
+    { mode: 'compound', rateBps: 1000 }, { mode: 'compound', rateBps: 1000 },
+    { mode: 'compound', rateBps: 2000 }, { mode: 'simple', rateBps: 500 },
+  ]);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'lap').nth(2)).toContainText(/۲۰\s*[٪%]/);
+  await expect(eventOf(page, id, 'lap').nth(3)).toContainText(/۵\s*[٪%]/);
+  await expect(eventOf(page, id, 'lap').nth(3)).toContainText(/ساده|ثابت|غیرمرکب/);
+  await saveCardEdit(page, id, 'اصلاح با نرخ‌های تاریخی', '300');
+  await debt(page, id, 225);
+  expect((await ledger(page)).game.cards.find((item) => item.id === id).laps).toBe(4);
+  await undo(page);
+  await debt(page, id, 150);
+  expect((await ledger(page)).game).toEqual(mixed.game);
+  const backup = await exportFile(page);
+  expect(backup.schemaVersion).toBe(3);
+  await page.locator('#reset').click();
+  await confirm(page);
+  await importFile(page, backup, false);
+  await expect(page.locator('#confirm-dialog')).toContainText(/ساده\s+۵\s*[٪%]/);
+  await expect(page.locator('#confirm-dialog')).toContainText('هاردکور خاموش');
+  await confirm(page);
+  await page.reload();
+  await debt(page, id, 150);
+  expect((await ledger(page)).game).toEqual(mixed.game);
+  await openRules(page);
+  await expect(page.locator('#interest-mode')).toHaveValue('simple');
+  await expect(page.locator('#compound-rate')).toHaveValue(/20|۲۰/);
+  await expect(page.locator('#simple-rate')).toHaveValue(/5|۵/);
+  await lap(page);
+  await debt(page, id, 155);
+});
+
+test('decimal percentages accept Latin, Persian and Arabic digits without rounding the running debt', async ({ page }) => {
+  await open(page);
+  await saveRules(page, { compoundRate: '12.5', simpleRate: '0.25' });
+  const first = await addCard(page, 'p1', 'دوازده و نیم درصد');
+  await lap(page);
+  await debt(page, first, 113);
+  await lap(page);
+  await debt(page, first, 127);
+  await saveRules(page, { compoundRate: '۱۲٫۲۵', simpleRate: '۰٫۵۰' });
+  await debt(page, first, 127);
+  expect((await ledger(page)).game.rules).toMatchObject({ compoundRateBps: 1225, simpleRateBps: 50 });
+  await saveRules(page, { mode: 'simple', compoundRate: '١٢.٧٥', simpleRate: '٢٫٥٠' });
+  expect((await ledger(page)).game.rules).toMatchObject({ mode: 'simple', compoundRateBps: 1275, simpleRateBps: 250 });
+  const fresh = await addCard(page, 'p2', 'کارت با تنظیم جدید');
+  await lap(page, 'p2');
+  await debt(page, fresh, 103);
+  await lap(page, 'p2');
+  await debt(page, fresh, 105);
+  await debt(page, first, 127);
+  await page.reload();
+  expect((await ledger(page)).game.rules).toMatchObject({ mode: 'simple', compoundRateBps: 1275, simpleRateBps: 250 });
+  await debt(page, fresh, 105);
+});
+
+test('zero interest permits continued laps and 100 percent uses strict equality before grace', async ({ page }) => {
+  await open(page);
+  await saveRules(page, { compoundRate: '0', simpleRate: '0' });
+  const id = await addCard(page, 'p1', 'بدون بهره');
+  for (let index = 0; index < 12; index += 1) await lap(page);
+  await debt(page, id, 100);
+  await expect(card(page, id)).toHaveAttribute('data-status', 'active');
+  expect((await ledger(page)).game.cards.find((item) => item.id === id).laps).toBe(12);
+  await saveRules(page, { mode: 'simple', compoundRate: '0', simpleRate: '0' });
+  await lap(page);
+  await debt(page, id, 100);
+  expect((await ledger(page)).game.cards.find((item) => item.id === id).laps).toBe(13);
+  await saveRules(page, { compoundRate: '100', simpleRate: '100' });
+  await debt(page, id, 100);
+  await lap(page);
+  await debt(page, id, 200);
+  await expect(card(page, id)).toHaveAttribute('data-status', 'active');
+  await lap(page);
+  await debt(page, id, 400);
+  await expect(card(page, id)).toHaveAttribute('data-status', 'grace');
+  await expect(page.locator('[data-lap="p1"]')).toBeDisabled();
+  await undo(page);
+  await debt(page, id, 200);
+  await expect(card(page, id)).toHaveAttribute('data-status', 'active');
+});
+
+test('invalid and unsaved interest settings never rewrite previous debt or change applied rules', async ({ page }) => {
+  await open(page);
+  const first = await addCard(page, 'p1', 'تنظیمات ذخیره‌نشده');
+  const other = await addCard(page, 'p2', 'صاحب مستقل');
+  await lap(page);
+  const before = await ledger(page);
+  await openRules(page);
+  for (const value of ['', '-1', '100.01', '1.001', 'NaN', 'Infinity', '1e2', '12,5']) {
+    await page.locator('#compound-rate').fill(value);
+    await page.locator('#save-rules').click();
+    await expect(page.locator('#rules-error')).toContainText(/نرخ|درصد|عدد|معتبر|۱۰۰|100|اعشار/);
+    expect(await ledger(page)).toEqual(before);
+  }
+  await page.locator('#compound-rate').fill('50');
+  await page.locator('#simple-rate').fill('-2');
+  await page.locator('#save-rules').click();
+  await expect(page.locator('#rules-error')).toContainText(/نرخ|درصد|عدد|معتبر/);
+  expect(await ledger(page)).toEqual(before);
+  await page.locator('#simple-rate').fill('25');
+  await page.locator('#interest-mode').selectOption('simple');
+  await page.locator('#hardcore').check();
+  await lap(page);
+  await debt(page, first, 121);
+  await debt(page, other, 100);
+  expect((await ledger(page)).game.rules).toEqual(before.game.rules);
+  await page.reload();
+  await openRules(page);
+  await expect(page.locator('#interest-mode')).toHaveValue('compound');
+  await expect(page.locator('#compound-rate')).toHaveValue(/10|۱۰/);
+  await expect(page.locator('#simple-rate')).toHaveValue(/10|۱۰/);
+  await expect(page.locator('#hardcore')).not.toBeChecked();
+  await debt(page, first, 121);
+});
+
+test('one saved rules change is one persistent undo action and leaves closed payments unchanged', async ({ page }) => {
+  await open(page);
+  const active = await addCard(page, 'p1', 'قواعد قابل برگشت');
+  const settled = await addCard(page, 'p2', 'پرداخت ثابت');
+  await lap(page, 'p2');
+  await action(page, settled, 'settle').click();
+  const before = await ledger(page);
+  await saveRules(page, { mode: 'simple', compoundRate: '30', simpleRate: '3.25', hardcore: true });
+  await debt(page, active, 100);
+  await expect(card(page, settled)).toHaveAttribute('data-paid', '110');
+  expect((await ledger(page)).undo).toHaveLength(before.undo.length + 1);
+  await page.reload();
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(before.game);
+  await openRules(page);
+  await expect(page.locator('#interest-mode')).toHaveValue('compound');
+  await expect(page.locator('#compound-rate')).toHaveValue(/10|۱۰/);
+  await expect(page.locator('#simple-rate')).toHaveValue(/10|۱۰/);
+  await expect(page.locator('#hardcore')).not.toBeChecked();
+  await expect(card(page, settled)).toHaveAttribute('data-paid', '110');
+});
+
+test('manual collective lap skips owners with unresolved grace and freezes every closed status in one undo', async ({ page }) => {
+  await seedLegacy(page, legacy([
+    { id: 'blocked-grace', p: 0, name: 'آخرین شانس مسدود', price: 200, laps: 8, auction: false },
+    { id: 'blocked-active', p: 0, name: 'فعال صاحب مسدود', price: 200, laps: 2, auction: false },
+    { id: 'free-one', p: 1, name: 'فعال آزاد اول', price: 200, laps: 2, auction: false },
+    { id: 'free-two', p: 2, name: 'فعال آزاد دوم', price: 200, laps: 0, auction: false },
+    { id: 'fixed-auction', p: 3, name: 'مزایده ثابت', price: 200, laps: 8, auction: true },
+    { id: 'fixed-closed', p: 4, name: 'مزایده بسته ثابت', price: 200, laps: 8, auction: true },
+    { id: 'fixed-settled', p: 5, name: 'تسویه ثابت', price: 200, laps: 2, auction: true, paid: 121 },
+  ]));
+  await open(page);
+  await action(page, 'fixed-closed', 'closeAuction').click();
+  const before = await ledger(page);
+  await lapAll(page);
+  await debt(page, 'blocked-grace', 214);
+  await debt(page, 'blocked-active', 121);
+  await debt(page, 'free-one', 133);
+  await debt(page, 'free-two', 110);
+  await debt(page, 'fixed-auction', 214);
+  await expect(card(page, 'fixed-closed')).toHaveAttribute('data-status', 'auction_closed');
+  await expect(card(page, 'fixed-settled')).toHaveAttribute('data-paid', '121');
+  const after = await ledger(page);
+  expect(after.undo).toHaveLength(before.undo.length + 1);
+  for (const id of ['blocked-grace', 'blocked-active', 'fixed-auction', 'fixed-closed', 'fixed-settled']) {
+    expect(after.game.cards.find((item) => item.id === id)).toEqual(before.game.cards.find((item) => item.id === id));
+  }
+  await showCardHistory(page, 'free-one');
+  await expect(eventOf(page, 'free-one', 'lapAll')).toHaveCount(1);
+  await expect(eventOf(page, 'free-one', 'lapAll')).toContainText(/همه|جمعی/);
+  await expect(eventOf(page, 'free-one', 'lapAll')).toContainText(/۱۰\s*[٪%]/);
+  await page.reload();
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(before.game);
+  await saveRules(page, { hardcore: true });
+  await expect(page.locator('[data-lap="p1"]')).toBeDisabled();
+  await expect(page.locator('[data-lap="p8"]')).toBeEnabled();
+  const hardcoreBefore = await ledger(page);
+  await lap(page, 'p8');
+  await debt(page, 'blocked-active', 121);
+  await debt(page, 'blocked-grace', 214);
+  await debt(page, 'free-one', 133);
+  await debt(page, 'free-two', 110);
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(hardcoreBefore.game);
+});
+
+test('collective crossing puts several owners in grace together then skips all their active cards', async ({ page }) => {
+  await seedLegacy(page, legacy([
+    { id: 'near-one', p: 0, name: 'نزدیک سقف اول', price: 200, laps: 7, auction: false },
+    { id: 'young-blocked', p: 0, name: 'تازه همان صاحب', price: 200, laps: 0, auction: false },
+    { id: 'near-two', p: 1, name: 'نزدیک سقف دوم', price: 200, laps: 7, auction: false },
+    { id: 'young-free', p: 2, name: 'صاحب آزاد', price: 200, laps: 1, auction: false },
+  ]));
+  await open(page);
+  await lapAll(page);
+  await debt(page, 'near-one', 214);
+  await debt(page, 'near-two', 214);
+  await expect(card(page, 'near-one')).toHaveAttribute('data-status', 'grace');
+  await expect(card(page, 'near-two')).toHaveAttribute('data-status', 'grace');
+  await debt(page, 'young-blocked', 110);
+  await debt(page, 'young-free', 121);
+  await expect(page.locator('[data-lap="p1"]')).toBeDisabled();
+  await expect(page.locator('[data-lap="p2"]')).toBeDisabled();
+  const crossed = await ledger(page);
+  await lapAll(page);
+  await debt(page, 'young-blocked', 110);
+  await debt(page, 'young-free', 133);
+  expect((await ledger(page)).game.cards.find((item) => item.id === 'near-one')).toEqual(crossed.game.cards.find((item) => item.id === 'near-one'));
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(crossed.game);
+});
+
+test('hardcore makes a player without cards trigger one collective lap with one undo and double-touch protection', async ({ page }) => {
+  await open(page);
+  const first = await addCard(page, 'p1', 'هاردکور اول');
+  const other = await addCard(page, 'p2', 'هاردکور دوم');
+  await expect(page.locator('[data-lap="p8"]')).toBeDisabled();
+  await saveRules(page, { hardcore: true });
+  await expect(page.locator('[data-lap="p8"]')).toBeEnabled();
+  const before = await ledger(page);
+  await lap(page, 'p8');
+  await debt(page, first, 110);
+  await debt(page, other, 110);
+  expect((await ledger(page)).undo).toHaveLength(before.undo.length + 1);
+  for (const id of [first, other]) {
+    const event = (await ledger(page)).game.cards.find((item) => item.id === id).history.at(-1);
+    expect(event).toMatchObject({ type: 'lapAll', triggerOwnerId: 'p8', interest: { mode: 'compound', rateBps: 1000 } });
+  }
+  await page.reload();
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(before.game);
+  await page.locator('[data-lap="p8"]').dblclick({ delay: 30 });
+  await debt(page, first, 110);
+  await debt(page, other, 110);
+  expect((await ledger(page)).game.cards.every((item) => item.laps === 1)).toBe(true);
+  await lapAll(page);
+  await debt(page, first, 121);
+  await debt(page, other, 121);
+  await undo(page);
+  await debt(page, first, 110);
+  await debt(page, other, 110);
+  await saveRules(page, { hardcore: false });
+  await expect(page.locator('[data-lap="p8"]')).toBeDisabled();
+  await lap(page, 'p1');
+  await debt(page, first, 121);
+  await debt(page, other, 110);
+});
+
+test('a rejected collective IndexedDB write preserves the complete saved game and retries once atomically', async ({ page }) => {
+  await open(page);
+  const first = await addCard(page, 'p1', 'تراکنش جمعی اول');
+  const other = await addCard(page, 'p2', 'تراکنش جمعی دوم');
+  const saved = await ledger(page);
+  await page.evaluate(() => {
+    window.originalLedgerPut = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (...args) {
+      if (this.name === 'ledger') throw new DOMException('Synthetic collective quota failure', 'QuotaExceededError');
+      return window.originalLedgerPut.apply(this, args);
+    };
+  });
+  await page.locator('#lap-all').click();
+  await expect(page.locator('#storage-status')).toContainText(/ذخیره.*(نشد|نشده|خطا)|خطا|ثبت.*نشد/);
+  expect(await ledger(page)).toEqual(saved);
+  await debt(page, first, 110);
+  await debt(page, other, 110);
+  const recovery = await exportFile(page);
+  expect(recovery.game.cards.every((item) => item.laps === 1)).toBe(true);
+  expect(recovery.game.cards.every((item) => item.history.filter((event) => event.type === 'lapAll').length === 1)).toBe(true);
+  await page.evaluate(() => { IDBObjectStore.prototype.put = window.originalLedgerPut; });
+  await page.locator('#retry-save').click();
+  await persisted(page, (data) => data.game.cards.every((item) => item.laps === 1));
+  expect((await ledger(page)).undo).toHaveLength(saved.undo.length + 1);
+  await page.reload();
+  await debt(page, first, 110);
+  await debt(page, other, 110);
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(saved.game);
+});
+
+test('mobile interest settings and collective histories fit 360px with saved decimal rates', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 360, height: 844 });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (entry) => { if (entry.type() === 'error') errors.push(entry.text()); });
+  await open(page);
+  await saveRules(page, { compoundRate: '۲٫۵', simpleRate: '٠٫٢٥', hardcore: true });
+  const first = await addCard(page, 'p1', 'موبایل جمعی اول');
+  const other = await addCard(page, 'p2', 'موبایل جمعی دوم');
+  await lap(page, 'p8');
+  await debt(page, first, 103);
+  await debt(page, other, 103);
+  await showCardHistory(page, first);
+  await expect(eventOf(page, first, 'lapAll')).toContainText(/۲[٫.]۵\s*[٪%]/);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  const overflowing = await page.locator('#rules-form input, #rules-form select, #rules-form button, #lap-all').evaluateAll((elements) => elements.filter((element) => {
+    const rectangle = element.getBoundingClientRect();
+    return rectangle.width > 0 && (rectangle.left < -1 || rectangle.right > innerWidth + 1);
+  }).map((element) => element.id));
+  expect(overflowing).toEqual([]);
+  if (process.env.CAPTURE_LEDGER_UI === '1') {
+    await openRules(page);
+    await page.locator('#rules-form').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('interest-settings-360.png') });
+  }
+  await page.reload();
+  expect((await ledger(page)).game.rules).toEqual({ mode: 'compound', compoundRateBps: 250, simpleRateBps: 25, hardcore: true });
+  await openRules(page);
+  await expect(page.locator('#hardcore')).toBeChecked();
+  await debt(page, first, 103);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   expect(errors).toEqual([]);
 });

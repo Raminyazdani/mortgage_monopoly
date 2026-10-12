@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
-import { applyAction, createGame, hydrateGameHistory } from '../src/domain.js';
+import { applyAction, calculate, createGame, hydrateGameHistory, SCHEMA_VERSION } from '../src/domain.js';
 import {
   CURRENT_KEY, DB_NAME, LEGACY_KEY, MAX_ARCHIVES, MAX_IMPORT_BYTES, MAX_TOTAL_HISTORY_EVENTS, STORE_NAME,
   LedgerStore, createEnvelope, exportEnvelope, parseImport, validateEnvelope,
@@ -30,6 +31,26 @@ const withoutHistory = game => {
   for (const card of old.cards) delete card.history;
   return old;
 };
+
+// Genuine schema-2 snapshots never contain rules or exact accrual plans.
+const asV2Game = game => {
+  const old = structuredClone(game);
+  delete old.rules;
+  for (const card of old.cards) {
+    delete card.accrual;
+    for (const event of card.history ?? []) {
+      delete event.interest;
+      for (const snapshot of [event.before, event.after]) if (snapshot) delete snapshot.accrual;
+    }
+  }
+  return old;
+};
+
+const asV2Envelope = envelope => ({ ...structuredClone(envelope), schemaVersion: 2,
+  game: asV2Game(envelope.game),
+  undo: envelope.undo.map(entry => ({ ...entry, game: asV2Game(entry.game) })),
+  archives: envelope.archives.map(asV2Game),
+});
 
 async function rawTransaction(indexedDB, action, mode = 'readonly') {
   const db = await new Promise((resolve, reject) => {
@@ -260,14 +281,14 @@ test('existing schema-2 saves atomically persist honest baselines for current, u
   const beforeLap = added(createGame(['رامین']));
   const old = {
     schemaVersion: 2, revision: 7,
-    game: withoutHistory(applyAction(beforeLap, { type: 'lap', ownerId: 'p1' })),
-    undo: [{ label: 'دور قدیمی', game: withoutHistory(beforeLap) }],
-    archives: [withoutHistory(added(createGame(['قدیمی'])))],
+    game: asV2Game(withoutHistory(applyAction(beforeLap, { type: 'lap', ownerId: 'p1' }))),
+    undo: [{ label: 'دور قدیمی', game: asV2Game(withoutHistory(beforeLap)) }],
+    archives: [asV2Game(withoutHistory(added(createGame(['قدیمی']))))],
   };
   await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
   try {
     const upgraded = await store.init();
-    assert.equal(upgraded.schemaVersion, 2);
+    assert.equal(upgraded.schemaVersion, SCHEMA_VERSION);
     assert.equal(upgraded.revision, 8);
     for (const game of [upgraded.game, upgraded.undo[0].game, upgraded.archives[0]]) {
       const [event] = game.cards[0].history;
@@ -292,7 +313,7 @@ test('existing schema-2 saves atomically persist honest baselines for current, u
 test('two simultaneous upgrades commit one revision and reuse the winner baseline IDs', async () => {
   const { store: first, options, indexedDB } = setup();
   const second = new LedgerStore(options);
-  const old = { ...createEnvelope(withoutHistory(added(createGame()))), revision: 4 };
+  const old = { schemaVersion: 2, revision: 4, game: asV2Game(withoutHistory(added(createGame()))), undo: [], archives: [] };
   await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
   try {
     const [a, b] = await Promise.all([first.init(), second.init()]);
@@ -303,13 +324,13 @@ test('two simultaneous upgrades commit one revision and reuse the winner baselin
   } finally { first.close(); second.close(); }
 });
 
-test('an old app action appends one unknown-time gap while a player-name change preserves event-time names', async () => {
+test('a genuine old app action appends one unknown-time gap while a player-name change preserves event-time names', async () => {
   const { store, indexedDB } = setup();
   try {
     const initial = await store.init();
     const game = added(createGame(['رامین']));
     const original = await store.save({ ...initial, game }, initial.revision);
-    const oldTab = structuredClone(original);
+    const oldTab = asV2Envelope(original);
     oldTab.game.cards[0].laps = 2;
     oldTab.revision += 1;
     await rawTransaction(indexedDB, objectStore => objectStore.put(oldTab, CURRENT_KEY), 'readwrite');
@@ -342,7 +363,7 @@ test('an old app action appends one unknown-time gap while a player-name change 
 
 test('failed additive upgrade leaves the old healthy financial snapshot and exposes pending history', async () => {
   const { store, indexedDB } = setup();
-  const old = { ...createEnvelope(withoutHistory(added(createGame()))), revision: 9 };
+  const old = { schemaVersion: 2, revision: 9, game: asV2Game(withoutHistory(added(createGame()))), undo: [], archives: [] };
   await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
   const originalPut = IDBObjectStore.prototype.put;
   try {
@@ -457,4 +478,236 @@ test('unavailable browser storage fails clearly without fabricating a saved game
     assert.equal(store.lastGood, null);
     assert.equal(store.readRaw(), null);
   } finally { store.close(); }
+});
+
+test('schema-2 finance, event identities, settlements and all 50 undo snapshots migrate without rewriting the past', async () => {
+  const { store, options, indexedDB } = setup();
+  let game = createGame(['رامین', 'سارا']);
+  for (const [ownerId, name] of [['p1', 'فعال'], ['p2', 'فرصت آخر'], ['p3', 'تسویه'], ['p4', 'مزایده']]) {
+    game = applyAction(game, { type: 'add', ownerId, name, price: 200 });
+  }
+  for (const ownerId of ['p1', 'p3']) for (let i = 0; i < 2; i += 1) game = applyAction(game, { type: 'lap', ownerId });
+  for (const ownerId of ['p2', 'p4']) for (let i = 0; i < 8; i += 1) game = applyAction(game, { type: 'lap', ownerId });
+  game = applyAction(game, { type: 'settle', cardId: game.cards[2].id });
+  game = applyAction(game, { type: 'auction', cardId: game.cards[3].id });
+  const old = asV2Envelope({ ...createEnvelope(game), revision: 17,
+    undo: Array.from({ length: 50 }, (_, index) => ({ label: `اقدام ${index}`, game })), archives: [game] });
+  const before = structuredClone(old);
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  try {
+    const migrated = await store.init();
+    assert.equal(migrated.schemaVersion, 3);
+    assert.equal(migrated.revision, 18);
+    assert.equal(migrated.undo.length, 50);
+    assert.deepEqual(migrated.game.cards.map(card => card.status), ['active', 'grace', 'settled', 'auction']);
+    for (const snapshot of [migrated.game, ...migrated.undo.map(entry => entry.game), ...migrated.archives]) {
+      assert.deepEqual(snapshot.rules, { mode: 'compound', compoundRateBps: 1000, simpleRateBps: 1000, hardcore: false });
+      for (const [index, card] of snapshot.cards.entries()) {
+        const original = before.game.cards[index];
+        assert.equal(card.laps, original.laps);
+        assert.equal(card.ownerId, original.ownerId);
+        assert.equal(calculate(card).debt, [121, 214, 121, 214][index]);
+        assert.deepEqual(card.settlement, original.settlement);
+        assert.deepEqual(card.accrual, [{ mode: 'compound', rateBps: 1000, laps: card.laps }]);
+        assert.deepEqual(card.history.map(event => [event.id, event.at, event.type]),
+          original.history.map(event => [event.id, event.at, event.type]));
+        assert.deepEqual(card.history.map(event => event.after.debt), original.history.map(event => event.after.debt));
+      }
+    }
+    assert.deepEqual(parseImport(exportEnvelope(migrated)), migrated);
+    const reopened = new LedgerStore(options);
+    try { assert.deepEqual(await reopened.init(), migrated); }
+    finally { reopened.close(); }
+  } finally { store.close(); }
+});
+
+test('even an empty schema-2 ledger persists schema-3 once and concurrent loads share that revision', async () => {
+  const { store: first, options, indexedDB } = setup();
+  const second = new LedgerStore(options);
+  const old = asV2Envelope({ ...createEnvelope(), revision: 23, archives: [createGame()] });
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  try {
+    const [a, b] = await Promise.all([first.init(), second.init()]);
+    assert.equal(a.schemaVersion, 3);
+    assert.equal(a.revision, 24);
+    assert.deepEqual(a, b);
+    assert.equal(a.game.cards.length, 0);
+    assert.equal(a.archives[0].rules.compoundRateBps, 1000);
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), a);
+    assert.deepEqual(await first.reload(), a);
+  } finally { first.close(); second.close(); }
+});
+
+test('variable future rates, modes and hardcore survive save, reload, export, import and undo', async () => {
+  const { store } = setup();
+  try {
+    const initial = await store.init();
+    let game = applyAction(added(initial.game), { type: 'lap', ownerId: 'p1' });
+    const before = game;
+    game = applyAction(game, { type: 'setRules', rules: {
+      mode: 'simple', compoundRateBps: 2500, simpleRateBps: 250, hardcore: true,
+    } });
+    assert.equal(calculate(game.cards[0]).debt, 110);
+    const changed = game;
+    game = applyAction(game, { type: 'lapAll' });
+    assert.equal(calculate(game.cards[0]).debt, 113);
+    game = applyAction(game, { type: 'setRules', rules: { ...game.rules, mode: 'compound' } });
+    game = applyAction(game, { type: 'lapAll' });
+    assert.equal(calculate(game.cards[0]).debt, 141);
+    const saved = await store.save({ ...initial, game, undo: [
+      { label: 'تغییر قواعد', game: before }, { label: 'دور جمعی', game: changed },
+    ], archives: [game] }, initial.revision);
+    assert.deepEqual(await store.reload(), saved);
+    assert.deepEqual(parseImport(exportEnvelope(saved)), saved);
+    assert.deepEqual(saved.game.cards[0].accrual, [
+      { mode: 'compound', rateBps: 1000, laps: 1 },
+      { mode: 'simple', rateBps: 250, laps: 1 },
+      { mode: 'compound', rateBps: 2500, laps: 1 },
+    ]);
+    const undone = await store.save({ ...saved, game: saved.undo[1].game, undo: saved.undo.slice(0, 1) }, saved.revision);
+    assert.equal(calculate(undone.game.cards[0]).debt, 110);
+    assert.equal(undone.game.cards[0].laps, 1);
+    assert.equal(undone.game.rules.mode, 'simple');
+    assert.deepEqual(parseImport(exportEnvelope(undone)), undone);
+  } finally { store.close(); }
+});
+
+test('schema-3 imports require complete finance plans and history across current, undo and archives', () => {
+  let game = applyAction(added(createGame()), { type: 'lap', ownerId: 'p1' });
+  game = applyAction(game, { type: 'setRules', rules: { ...game.rules, simpleRateBps: 375, mode: 'simple' } });
+  game = applyAction(game, { type: 'lapAll' });
+  const valid = { ...createEnvelope(game), undo: [{ label: 'کار', game }], archives: [game] };
+  for (const select of [envelope => envelope.game, envelope => envelope.undo[0].game, envelope => envelope.archives[0]]) {
+    for (const mutate of [
+      snapshot => { delete snapshot.rules; },
+      snapshot => { delete snapshot.cards[0].accrual; },
+      snapshot => { delete snapshot.cards[0].history; },
+      snapshot => { delete snapshot.cards[0].history[0].after.accrual; },
+      snapshot => { delete snapshot.cards[0].history[1].before.accrual; },
+      snapshot => { snapshot.cards[0].accrual[0].rateBps = 10_001; },
+      snapshot => { snapshot.cards[0].accrual[0].laps = 1_000_000_000; },
+      snapshot => { snapshot.cards[0].history[0].after.accrual = Array(501).fill({ mode: 'compound', rateBps: 0, laps: 1 }); },
+      snapshot => { snapshot.cards[0].accrual.push({ ...snapshot.cards[0].accrual.at(-1) }); },
+    ]) {
+      const invalid = structuredClone(valid);
+      mutate(select(invalid));
+      assert.throws(() => parseImport(JSON.stringify(invalid)), error => error.code === 'INVALID_DATA');
+    }
+  }
+  const gap = structuredClone(valid);
+  gap.game.cards[0].name = 'تغییر ثبت‌نشده';
+  assert.throws(() => parseImport(JSON.stringify(gap)), error => error.code === 'INVALID_DATA');
+});
+
+test('genuine schema-2 imports reject injected new financial fields instead of laundering mixed plans', () => {
+  const source = applyAction(added(createGame()), { type: 'lap', ownerId: 'p1' });
+  const old = asV2Envelope(createEnvelope(source));
+  assert.equal(parseImport(JSON.stringify(old)).schemaVersion, 3);
+  for (const mutate of [
+    envelope => { envelope.game.rules = source.rules; },
+    envelope => { envelope.game.cards[0].accrual = source.cards[0].accrual; },
+    envelope => { envelope.game.cards[0].history[0].after.accrual = []; },
+    envelope => { envelope.game.cards[0].history[1].before.accrual = []; },
+    envelope => { envelope.game.cards[0].history[1].interest = { mode: 'compound', rateBps: 1000 }; },
+    envelope => { envelope.game.cards[0].history[1].rulesBefore = source.rules; },
+    envelope => { envelope.game.cards[0].history[1].type = 'lapAll'; },
+  ]) {
+    const invalid = structuredClone(old);
+    mutate(invalid);
+    assert.throws(() => parseImport(JSON.stringify(invalid)), error => error.code === 'INVALID_DATA');
+  }
+});
+
+test('a failed collective save keeps every old balance durable and retries the same whole action once', async () => {
+  const { store, indexedDB } = setup();
+  const originalPut = IDBObjectStore.prototype.put;
+  try {
+    const initial = await store.init();
+    let game = added(initial.game);
+    game = applyAction(game, { type: 'add', ownerId: 'p2', name: 'کارت دوم', price: 400 });
+    const before = await store.save({ ...initial, game }, initial.revision);
+    const candidate = { ...before, game: applyAction(game, { type: 'lapAll' }),
+      undo: [{ label: 'یک دور برای همه', game }] };
+    IDBObjectStore.prototype.put = function () { throw new DOMException('Test quota exhausted', 'QuotaExceededError'); };
+    await assert.rejects(store.save(candidate, before.revision), error => error.code === 'QUOTA');
+    assert.deepEqual(store.lastGood, before);
+    assert.deepEqual(store.pending, candidate);
+    IDBObjectStore.prototype.put = originalPut;
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), before);
+    const saved = await store.save(candidate, before.revision);
+    assert.deepEqual(saved.game.cards.map(card => [card.laps, calculate(card).debt]), [[1, 110], [1, 220]]);
+    assert.equal(saved.undo.length, 1);
+    assert.deepEqual(await store.reload(), saved);
+  } finally { IDBObjectStore.prototype.put = originalPut; store.close(); }
+});
+
+test('concurrent global lap and rules change commit only one complete revision', async () => {
+  const { store: first, options } = setup();
+  const second = new LedgerStore(options);
+  try {
+    const initial = await first.init();
+    const before = await first.save({ ...initial, game: added(initial.game) }, initial.revision);
+    const other = await second.init();
+    const results = await Promise.allSettled([
+      first.save({ ...before, game: applyAction(before.game, { type: 'lapAll' }),
+        undo: [{ label: 'جمعی', game: before.game }] }, before.revision),
+      second.save({ ...other, game: applyAction(other.game, { type: 'setRules', rules: {
+        ...other.game.rules, compoundRateBps: 2500, hardcore: true,
+      } }), undo: [{ label: 'قواعد', game: other.game }] }, other.revision),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const winner = results.find(result => result.status === 'fulfilled').value;
+    const loser = results.find(result => result.status === 'rejected').reason;
+    assert.equal(loser.code, 'CONFLICT');
+    assert.deepEqual(loser.latest, winner);
+    assert.equal(winner.undo.length, 1);
+    assert.deepEqual(await second.reload(), winner);
+  } finally { first.close(); second.close(); }
+});
+
+test('unknown schema-4 on disk fails without mutating raw data or permitting a save', async () => {
+  const { store, indexedDB } = setup();
+  const future = { ...createEnvelope(added(createGame())), schemaVersion: 4, revision: 8 };
+  await rawTransaction(indexedDB, objectStore => objectStore.put(future, CURRENT_KEY), 'readwrite');
+  try {
+    await assert.rejects(store.init(), error => error.code === 'UNKNOWN_SCHEMA');
+    assert.deepEqual(JSON.parse(store.readRaw()), future);
+    const candidate = { ...createEnvelope(added(createGame())), revision: 8 };
+    await assert.rejects(store.save(candidate, 8), error => error.code === 'UNKNOWN_SCHEMA');
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), future);
+  } finally { store.close(); }
+});
+
+test('the actual shipped schema-2 client cannot overwrite schema-3 from a stale tab', async t => {
+  const shipped = '9c537d5e4f20f48bc00e13f34df29faa2bde9a1e';
+  let domainSource;
+  let storageSource;
+  try {
+    domainSource = execFileSync('git', ['show', `${shipped}:src/domain.js`], { encoding: 'utf8', windowsHide: true });
+    storageSource = execFileSync('git', ['show', `${shipped}:src/storage.js`], { encoding: 'utf8', windowsHide: true });
+  } catch {
+    t.skip('Shipped schema-2 sources are unavailable in this checkout.');
+    return;
+  }
+  const domainUrl = `data:text/javascript;base64,${Buffer.from(domainSource).toString('base64')}`;
+  const oldDomain = await import(domainUrl);
+  const oldStorage = await import(`data:text/javascript;base64,${Buffer.from(storageSource.replace("'./domain.js'", JSON.stringify(domainUrl))).toString('base64')}`);
+  const { store: upgradedClient, options, indexedDB } = setup();
+  const stale = new oldStorage.LedgerStore(options);
+  const old = oldStorage.createEnvelope(oldDomain.applyAction(oldDomain.createGame(), {
+    type: 'add', ownerId: 'p1', name: 'قدیمی', price: 200,
+  }));
+  await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+  try {
+    const staleSnapshot = await stale.init();
+    const migrated = await upgradedClient.init();
+    assert.equal(migrated.schemaVersion, 3);
+    const updated = await upgradedClient.save({ ...migrated, game: applyAction(migrated.game, {
+      type: 'setRules', rules: { ...migrated.game.rules, compoundRateBps: 3750, hardcore: true },
+    }) }, migrated.revision);
+    const staleChange = { ...staleSnapshot, game: oldDomain.applyAction(staleSnapshot.game, { type: 'lap', ownerId: 'p1' }) };
+    await assert.rejects(stale.save(staleChange, staleSnapshot.revision), error => error.code === 'UNKNOWN_SCHEMA');
+    await assert.rejects(stale.reload(), error => error.code === 'UNKNOWN_SCHEMA');
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), updated);
+  } finally { stale.close(); upgradedClient.close(); }
 });
