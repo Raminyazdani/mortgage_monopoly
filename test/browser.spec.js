@@ -179,14 +179,26 @@ async function openRules(page) {
   await expect(page.locator('#rules-form')).toBeVisible();
 }
 
-async function saveRules(page, { mode = 'compound', compoundRate = '10', simpleRate = '10', hardcore = false }) {
+async function fillRules(page, { mode = 'compound', compoundRate = '10', simpleRate = '10', hardcore = false }) {
   await openRules(page);
   await page.locator('#interest-mode').selectOption(mode);
   await page.locator('#compound-rate').fill(String(compoundRate));
   await page.locator('#simple-rate').fill(String(simpleRate));
   await page.locator('#hardcore').setChecked(hardcore);
+}
+
+async function saveRules(page, rules) {
+  await fillRules(page, rules);
   const revision = (await ledger(page)).revision;
   await page.locator('#save-rules').click();
+  await persisted(page, (data) => data.revision > revision);
+}
+
+async function reapplyRules(page, rules) {
+  await fillRules(page, rules);
+  const revision = (await ledger(page)).revision;
+  await page.locator('#reapply-rules').click();
+  await confirm(page);
   await persisted(page, (data) => data.revision > revision);
 }
 
@@ -1274,6 +1286,268 @@ test('a rejected collective IndexedDB write preserves the complete saved game an
   await debt(page, other, 110);
   await undo(page);
   expect((await ledger(page)).game).toEqual(saved.game);
+});
+
+test('retrospective interest preview, cancel and Escape never write debt, rules or undo', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'پیش‌نمایش دوباره حساب کردن');
+  await lap(page);
+  await lap(page);
+  const before = await ledger(page);
+  await fillRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5', hardcore: true });
+  await page.locator('#reapply-rules').click();
+  await expect(page.locator('#confirm-dialog')).toBeVisible();
+  await expect(page.locator('#confirm-dialog')).toContainText('اعمال بهره روی دورهای قبلی');
+  await expect(page.locator('#dialog-body')).toContainText('پیش‌نمایش دوباره حساب کردن');
+  await expect(page.locator('#dialog-body')).toContainText(/ساده\s+۵\s*[٪%]/);
+  await expect(page.locator('#dialog-body')).toContainText('۱۲۱');
+  await expect(page.locator('#dialog-body')).toContainText('۱۱۰');
+  expect(await ledger(page)).toEqual(before);
+  await page.locator('#cancel-action').click();
+  await expect(page.locator('#confirm-dialog')).not.toBeVisible();
+  expect(await ledger(page)).toEqual(before);
+  await debt(page, id, 121);
+  await page.locator('#reapply-rules').click();
+  await expect(page.locator('#confirm-dialog')).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#confirm-dialog')).not.toBeVisible();
+  expect(await ledger(page)).toEqual(before);
+  await debt(page, id, 121);
+});
+
+test('retrospective interest replaces mixed past rates with current rules in one persistent undo and backup', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'چهار دور با نرخ‌های مختلف');
+  await lap(page);
+  await lap(page);
+  await saveRules(page, { compoundRate: '20', simpleRate: '5' });
+  await lap(page);
+  await saveRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5' });
+  await lap(page);
+  await debt(page, id, 150);
+  const before = await ledger(page);
+  await reapplyRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5' });
+  await debt(page, id, 120);
+  const after = await ledger(page);
+  const recalculated = after.game.cards.find((item) => item.id === id);
+  expect(recalculated.laps).toBe(4);
+  expect(recalculated.accrual).toEqual([{ mode: 'simple', rateBps: 500, laps: 4 }]);
+  expect(recalculated.history.slice(0, -1)).toEqual(before.game.cards.find((item) => item.id === id).history);
+  expect(after.game.rules).toEqual(before.game.rules);
+  expect(after.undo).toHaveLength(before.undo.length + 1);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'rulesReapplied')).toHaveCount(1);
+  await expect(eventOf(page, id, 'rulesReapplied')).toContainText(/دورهای قبلی|دوباره|محاسبه/);
+  await expect(eventOf(page, id, 'rulesReapplied')).toContainText('۱۵۰');
+  await expect(eventOf(page, id, 'rulesReapplied')).toContainText('۱۲۰');
+  const backup = await exportFile(page);
+  await page.reload();
+  await undo(page);
+  await debt(page, id, 150);
+  expect((await ledger(page)).game).toEqual(before.game);
+  await importFile(page, backup);
+  await page.reload();
+  await debt(page, id, 120);
+  expect((await ledger(page)).game).toEqual(after.game);
+  await showCardHistory(page, id);
+  await expect(eventOf(page, id, 'rulesReapplied')).toHaveCount(1);
+  await lap(page);
+  await debt(page, id, 125);
+  expect((await ledger(page)).game.cards.find((item) => item.id === id).laps).toBe(5);
+});
+
+test('retrospective interest reactivates grace at lower rates and restores grace at the first higher-rate crossing', async ({ page }) => {
+  await seedLegacy(page, legacy([
+    { id: 'reopen-grace', p: 0, name: 'کارت آخرین شانس قابل بازگشت', price: 200, laps: 8, auction: false },
+  ]));
+  await open(page);
+  await debt(page, 'reopen-grace', 214);
+  await expect(card(page, 'reopen-grace')).toHaveAttribute('data-status', 'grace');
+  const before = await ledger(page);
+  await reapplyRules(page, { mode: 'simple', simpleRate: '5' });
+  await debt(page, 'reopen-grace', 140);
+  await expect(card(page, 'reopen-grace')).toHaveAttribute('data-status', 'active');
+  await expect(page.locator('[data-lap="p1"]')).toBeEnabled();
+  expect((await ledger(page)).game.cards.find((item) => item.id === 'reopen-grace').laps).toBe(8);
+  await reapplyRules(page, { compoundRate: '20', simpleRate: '5' });
+  await debt(page, 'reopen-grace', 207);
+  await expect(card(page, 'reopen-grace')).toHaveAttribute('data-status', 'grace');
+  await expect(page.locator('[data-lap="p1"]')).toBeDisabled();
+  const higher = (await ledger(page)).game.cards.find((item) => item.id === 'reopen-grace');
+  expect(higher.laps).toBe(8);
+  expect(higher.interestStopLap).toBe(4);
+  await expect(card(page, 'reopen-grace')).toHaveAttribute('data-interest-stop-lap', '4');
+  await undo(page);
+  await debt(page, 'reopen-grace', 140);
+  await expect(card(page, 'reopen-grace')).toHaveAttribute('data-status', 'active');
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(before.game);
+});
+
+test('retrospective interest keeps recorded laps while freezing at the first crossing and preserves all closed cards exactly', async ({ page }) => {
+  await seedLegacy(page, legacy([
+    { id: 'past-eight', p: 0, name: 'هشت دور ثبت‌شده', price: 200, laps: 8, auction: false },
+    { id: 'frozen-auction', p: 1, name: 'مزایده دست‌نخورده', price: 200, laps: 8, auction: true },
+    { id: 'frozen-closed', p: 2, name: 'مزایده بسته دست‌نخورده', price: 200, laps: 8, auction: true },
+    { id: 'frozen-paid', p: 3, name: 'تسویه دست‌نخورده', price: 200, laps: 2, auction: true, paid: 121 },
+  ]));
+  await open(page);
+  await action(page, 'frozen-closed', 'closeAuction').click();
+  const before = await ledger(page);
+  await fillRules(page, { compoundRate: '100', simpleRate: '100' });
+  await page.locator('#reapply-rules').click();
+  await expect(page.locator('#dialog-body')).toContainText(/تسویه|مزایده/);
+  await expect(page.locator('#dialog-body')).toContainText('۴۰۰');
+  await confirm(page);
+  await debt(page, 'past-eight', 400);
+  const after = await ledger(page);
+  const updated = after.game.cards.find((item) => item.id === 'past-eight');
+  expect(updated.laps).toBe(8);
+  expect(updated.interestStopLap).toBe(2);
+  expect(updated.accrual).toEqual([{ mode: 'compound', rateBps: 10000, laps: 8 }]);
+  await expect(card(page, 'past-eight')).toHaveAttribute('data-interest-stop-lap', '2');
+  await expect(card(page, 'past-eight')).toContainText(/بهره در دور ۲ متوقف/);
+  await expect(card(page, 'past-eight')).toContainText(/دور ثبت‌شده ۸ حفظ/);
+  for (const id of ['frozen-auction', 'frozen-closed', 'frozen-paid']) {
+    expect(after.game.cards.find((item) => item.id === id)).toEqual(before.game.cards.find((item) => item.id === id));
+  }
+  expect(after.undo).toHaveLength(before.undo.length + 1);
+  await page.reload();
+  await debt(page, 'past-eight', 400);
+  await expect(card(page, 'past-eight')).toHaveAttribute('data-interest-stop-lap', '2');
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(before.game);
+});
+
+test('retrospective interest can clear an earlier freeze and then resume future laps without losing recorded laps', async ({ page }) => {
+  await seedLegacy(page, legacy([
+    { id: 'resume-eight', p: 0, name: 'از سرگیری دورها', price: 200, laps: 8, auction: false },
+  ]));
+  await open(page);
+  await reapplyRules(page, { compoundRate: '100' });
+  await debt(page, 'resume-eight', 400);
+  await saveRules(page, { compoundRate: '0', simpleRate: '0' });
+  await debt(page, 'resume-eight', 400);
+  await expect(card(page, 'resume-eight')).toHaveAttribute('data-status', 'grace');
+  await reapplyRules(page, { compoundRate: '0', simpleRate: '0' });
+  await debt(page, 'resume-eight', 100);
+  await expect(card(page, 'resume-eight')).toHaveAttribute('data-status', 'active');
+  expect((await ledger(page)).game.cards.find((item) => item.id === 'resume-eight').interestStopLap).toBeUndefined();
+  await expect(card(page, 'resume-eight')).not.toHaveAttribute('data-interest-stop-lap', /\d+/);
+  await lap(page);
+  await debt(page, 'resume-eight', 100);
+  expect((await ledger(page)).game.cards.find((item) => item.id === 'resume-eight').laps).toBe(9);
+});
+
+test('retrospective interest rejects invalid rates and repeating the same reapply creates no undo', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'اصلاح نرخ معتبر');
+  await lap(page);
+  await lap(page);
+  const before = await ledger(page);
+  await openRules(page);
+  for (const value of ['', '-1', '100.01', '1.001', 'NaN', '1e2']) {
+    await page.locator('#compound-rate').fill(value);
+    await page.locator('#reapply-rules').click();
+    await expect(page.locator('#rules-error')).toContainText(/نرخ|درصد|عدد|معتبر|۱۰۰|100|اعشار/);
+    await expect(page.locator('#confirm-dialog')).not.toBeVisible();
+    expect(await ledger(page)).toEqual(before);
+  }
+  await reapplyRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5' });
+  await debt(page, id, 110);
+  const applied = await ledger(page);
+  await page.locator('#reapply-rules').click();
+  await expect(page.locator('#confirm-dialog')).not.toBeVisible();
+  await expect(page.locator('#message')).toContainText('تنظیمات و محاسبهٔ دورهای قبلی تغییری نکرد.');
+  expect(await ledger(page)).toEqual(applied);
+  await page.reload();
+  await debt(page, id, 110);
+  expect((await ledger(page)).undo).toHaveLength(applied.undo.length);
+});
+
+test('retrospective interest rejected save retries once and clears settings error', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'دوباره حساب کردن با خطای ذخیره');
+  await lap(page);
+  await lap(page);
+  await debt(page, id, 121);
+  const saved = await ledger(page);
+  await page.evaluate(() => {
+    window.originalLedgerPut = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (...args) {
+      if (this.name === 'ledger') throw new DOMException('Synthetic retrospective quota failure', 'QuotaExceededError');
+      return window.originalLedgerPut.apply(this, args);
+    };
+  });
+  await fillRules(page, { mode: 'simple', compoundRate: '20', simpleRate: '5' });
+  await page.locator('#reapply-rules').click();
+  await confirm(page);
+  await expect(page.locator('#storage-status')).toContainText(/ذخیره.*(نشد|نشده|خطا)|خطا|ثبت.*نشد/);
+  await expect(page.locator('#rules-error')).toBeVisible();
+  await expect(page.locator('#retry-save')).toBeVisible();
+  expect(await ledger(page)).toEqual(saved);
+  await debt(page, id, 110);
+  const recovery = await exportFile(page);
+  expect(recovery.game.cards.find((item) => item.id === id).history.filter((event) => event.type === 'rulesReapplied')).toHaveLength(1);
+  expect(recovery.game.cards.find((item) => item.id === id).laps).toBe(2);
+  expect(recovery.undo).toHaveLength(saved.undo.length + 1);
+  await page.evaluate(() => { IDBObjectStore.prototype.put = window.originalLedgerPut; });
+  await page.locator('#retry-save').click();
+  await persisted(page, (data) => data.game.rules.mode === 'simple' && data.revision > saved.revision);
+  await expect(page.locator('#retry-save')).not.toBeVisible();
+  await expect(page.locator('#rules-error')).not.toBeVisible();
+  await expect(page.locator('#rules-note')).not.toContainText('هنوز ثبت نشده');
+  const committed = await ledger(page);
+  expect(committed.game).toEqual(recovery.game);
+  expect(committed.undo).toHaveLength(saved.undo.length + 1);
+  expect(committed.game.cards.find((item) => item.id === id).history.filter((event) => event.type === 'rulesReapplied')).toHaveLength(1);
+  await page.reload();
+  await debt(page, id, 110);
+  await expect(page.locator('#rules-error')).not.toBeVisible();
+  await undo(page);
+  expect((await ledger(page)).game).toEqual(saved.game);
+  await debt(page, id, 121);
+});
+
+test('retrospective interest controls, confirmation and frozen-lap history fit 360px', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 360, height: 800 });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await seedLegacy(page, legacy([
+    { id: 'mobile-retro', p: 0, name: 'کارت موبایل با دورهای قبلی', price: 200, laps: 8, auction: false },
+  ]));
+  await open(page);
+  await fillRules(page, { compoundRate: '۱۰۰', simpleRate: '۲٫۵', hardcore: true });
+  await expect(page.locator('#save-rules')).toBeVisible();
+  await expect(page.locator('#reapply-rules')).toBeVisible();
+  const overflow = await page.locator('#rules-form input, #rules-form select, #rules-form button').evaluateAll((elements) => elements.some((element) => {
+    const rectangle = element.getBoundingClientRect();
+    return rectangle.left < -1 || rectangle.right > innerWidth + 1;
+  }));
+  expect(overflow).toBe(false);
+  await page.locator('#reapply-rules').click();
+  await expect(page.locator('#confirm-dialog')).toBeVisible();
+  expect(await page.locator('#confirm-dialog').evaluate((element) => {
+    const rectangle = element.getBoundingClientRect();
+    return rectangle.left >= -1 && rectangle.right <= innerWidth + 1
+      && element.scrollWidth <= element.clientWidth + 1;
+  })).toBe(true);
+  if (process.env.CAPTURE_LEDGER_UI === '1') {
+    await page.screenshot({ path: testInfo.outputPath('retrospective-confirm-360.png') });
+  }
+  await confirm(page);
+  await debt(page, 'mobile-retro', 400);
+  await showCardHistory(page, 'mobile-retro');
+  await expect(eventOf(page, 'mobile-retro', 'rulesReapplied')).toContainText(/دور|محاسبه/);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  if (process.env.CAPTURE_LEDGER_UI === '1') {
+    await card(page, 'mobile-retro').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('retrospective-history-360.png') });
+  }
+  await page.reload();
+  await debt(page, 'mobile-retro', 400);
+  await expect(card(page, 'mobile-retro')).toHaveAttribute('data-interest-stop-lap', '2');
+  expect(errors).toEqual([]);
 });
 
 test('mobile interest settings and collective histories fit 360px with saved decimal rates', async ({ page }, testInfo) => {

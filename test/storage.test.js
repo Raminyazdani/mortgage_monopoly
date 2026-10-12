@@ -611,6 +611,10 @@ test('genuine schema-2 imports reject injected new financial fields instead of l
     envelope => { envelope.game.cards[0].history[1].interest = { mode: 'compound', rateBps: 1000 }; },
     envelope => { envelope.game.cards[0].history[1].rulesBefore = source.rules; },
     envelope => { envelope.game.cards[0].history[1].type = 'lapAll'; },
+    envelope => { envelope.game.cards[0].interestStopLap = 1; },
+    envelope => { envelope.game.cards[0].history[0].after.interestStopLap = 1; },
+    envelope => { envelope.game.cards[0].history[1].before.interestStopLap = 1; },
+    envelope => { envelope.game.cards[0].history[1].type = 'rulesReapplied'; },
   ]) {
     const invalid = structuredClone(old);
     mutate(invalid);
@@ -710,4 +714,197 @@ test('the actual shipped schema-2 client cannot overwrite schema-3 from a stale 
     await assert.rejects(stale.reload(), error => error.code === 'UNKNOWN_SCHEMA');
     assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), updated);
   } finally { stale.close(); upgradedClient.close(); }
+});
+
+function retrospectiveFixture() {
+  let game = added(createGame());
+  for (let lap = 0; lap < 8; lap += 1) game = applyAction(game, { type: 'lap', ownerId: 'p1' });
+  game = applyAction(game, { type: 'add', ownerId: 'p2', name: 'فعال', price: 200 });
+  for (let lap = 0; lap < 2; lap += 1) game = applyAction(game, { type: 'lap', ownerId: 'p2' });
+  game = applyAction(game, { type: 'add', ownerId: 'p3', name: 'تسویه', price: 200 });
+  game = applyAction(game, { type: 'lap', ownerId: 'p3' });
+  game = applyAction(game, { type: 'settle', cardId: game.cards.at(-1).id });
+  for (const [ownerId, close] of [['p4', false], ['p5', true]]) {
+    game = applyAction(game, { type: 'add', ownerId, name: 'مزایده', price: 200 });
+    for (let lap = 0; lap < 8; lap += 1) game = applyAction(game, { type: 'lap', ownerId });
+    const cardId = game.cards.at(-1).id;
+    game = applyAction(game, { type: 'auction', cardId });
+    if (close) game = applyAction(game, { type: 'closeAuction', cardId });
+  }
+  return game;
+}
+
+const reapplied = game => applyAction(game, { type: 'reapplyRules', rules: {
+  ...game.rules, mode: 'compound', compoundRateBps: 4000,
+} });
+
+test('retrospective rules, preserved laps and stop markers roundtrip with undo and archives', async () => {
+  const { store } = setup();
+  try {
+    const initial = await store.init();
+    const before = retrospectiveFixture();
+    const game = reapplied(before);
+    assert.equal(game.cards[0].laps, 8);
+    assert.equal(game.cards[0].interestStopLap, 3);
+    assert.equal(calculate(game.cards[0]).debt, 274);
+    assert.equal(calculate(game.cards[1]).debt, 196);
+    assert.deepEqual(game.cards.slice(2), before.cards.slice(2));
+    const saved = await store.save({ ...initial, game,
+      undo: [{ label: 'اعمال روی دورهای قبلی', game: before }], archives: [game] }, initial.revision);
+    assert.equal(saved.schemaVersion, 3);
+    assert.deepEqual(await store.reload(), saved);
+    assert.deepEqual(parseImport(exportEnvelope(saved)), saved);
+    assert.deepEqual(saved.game.cards[0].history.slice(0, -1), before.cards[0].history);
+    const event = saved.game.cards[0].history.at(-1);
+    assert.equal(event.type, 'rulesReapplied');
+    assert.equal(event.before.laps, 8);
+    assert.equal(event.after.laps, 8);
+    assert.equal(event.after.interestStopLap, 3);
+    const lowGame = applyAction(saved.game, { type: 'reapplyRules', rules: {
+      ...saved.game.rules, compoundRateBps: 0,
+    } });
+    const low = await store.save({ ...saved, game: lowGame, undo: [
+      ...saved.undo, { label: 'کاهش بهرهٔ قبلی', game: saved.game },
+    ] }, saved.revision);
+    assert.equal(low.game.cards[0].status, 'active');
+    assert.equal(low.game.cards[0].laps, 8);
+    assert.equal(low.game.cards[0].interestStopLap, undefined);
+    assert.equal(calculate(low.game.cards[0]).debt, 100);
+    assert.deepEqual(low.game.cards.slice(2), before.cards.slice(2));
+    const undone = await store.save({ ...low, game: low.undo.at(-1).game,
+      undo: low.undo.slice(0, -1) }, low.revision);
+    assert.deepEqual(undone.game, saved.game);
+    assert.deepEqual(await store.reload(), undone);
+    assert.deepEqual(parseImport(exportEnvelope(undone)), undone);
+  } finally { store.close(); }
+});
+
+test('retrospective imports reject corrupt stop markers and event chains in every snapshot', () => {
+  const game = reapplied(retrospectiveFixture());
+  const valid = { ...createEnvelope(game), undo: [{ label: 'دورهای قبلی', game }], archives: [game] };
+  for (const select of [envelope => envelope.game, envelope => envelope.undo[0].game, envelope => envelope.archives[0]]) {
+    for (const mutate of [
+      snapshot => { snapshot.cards[0].interestStopLap = null; },
+      snapshot => { snapshot.cards[0].interestStopLap = 0; },
+      snapshot => { snapshot.cards[0].interestStopLap = 1.5; },
+      snapshot => { snapshot.cards[0].interestStopLap = '3'; },
+      snapshot => { snapshot.cards[0].interestStopLap = 8; },
+      snapshot => { snapshot.cards[0].interestStopLap = 1_000_000_000; },
+      snapshot => { snapshot.cards[0].interestStopLap = 2; },
+      snapshot => { delete snapshot.cards[0].interestStopLap; },
+      snapshot => { snapshot.cards[1].interestStopLap = 1; },
+      snapshot => { snapshot.cards[0].history.at(-1).after.interestStopLap = null; },
+      snapshot => { snapshot.cards[0].history.at(-1).after.interestStopLap = 8; },
+      snapshot => { snapshot.cards[0].history.at(-1).before.interestStopLap = 1; },
+      snapshot => { snapshot.cards[0].history.at(-1).after.debt += 1; },
+      snapshot => { snapshot.cards[0].history.at(-1).after.laps -= 1; },
+      snapshot => { snapshot.cards[0].history.at(-1).rulesAfter.compoundRateBps = 3000; },
+      snapshot => { snapshot.cards[0].history.at(-1).type = 'unknown'; },
+    ]) {
+      const invalid = structuredClone(valid);
+      mutate(select(invalid));
+      assert.throws(() => parseImport(JSON.stringify(invalid)), error => error.code === 'INVALID_DATA');
+    }
+  }
+  // Current-schema gaps are errors, never an invitation to invent a baseline.
+  const gap = structuredClone(valid);
+  gap.game.cards[0].history.pop();
+  assert.throws(() => parseImport(JSON.stringify(gap)), error => error.code === 'INVALID_DATA');
+});
+
+test('a failed retrospective save preserves the whole old game and retries without duplicate events', async () => {
+  const { store, indexedDB } = setup();
+  const originalPut = IDBObjectStore.prototype.put;
+  try {
+    const initial = await store.init();
+    const game = retrospectiveFixture();
+    const before = await store.save({ ...initial, game }, initial.revision);
+    const candidate = { ...before, game: reapplied(game),
+      undo: [{ label: 'اعمال روی دورهای قبلی', game }] };
+    IDBObjectStore.prototype.put = function () { throw new DOMException('Test quota exhausted', 'QuotaExceededError'); };
+    await assert.rejects(store.save(candidate, before.revision), error => error.code === 'QUOTA');
+    assert.deepEqual(store.lastGood, before);
+    assert.deepEqual(store.pending, candidate);
+    IDBObjectStore.prototype.put = originalPut;
+    assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), before);
+    assert.deepEqual(parseImport(exportEnvelope(store.pending)), candidate);
+    const saved = await store.save(candidate, before.revision);
+    assert.deepEqual(saved.game, candidate.game);
+    assert.equal(saved.game.cards[0].history.filter(event => event.type === 'rulesReapplied').length, 1);
+    assert.equal(saved.game.cards[1].history.filter(event => event.type === 'rulesReapplied').length, 1);
+    assert.equal(saved.undo.length, 1);
+    assert.deepEqual(await store.reload(), saved);
+  } finally { IDBObjectStore.prototype.put = originalPut; store.close(); }
+});
+
+test('concurrent retrospective recalculation and lap commit only one complete revision', async () => {
+  const { store: first, options } = setup();
+  const second = new LedgerStore(options);
+  try {
+    const initial = await first.init();
+    const before = await first.save({ ...initial, game: retrospectiveFixture() }, initial.revision);
+    const other = await second.init();
+    const results = await Promise.allSettled([
+      first.save({ ...before, game: reapplied(before.game),
+        undo: [{ label: 'دورهای قبلی', game: before.game }] }, before.revision),
+      second.save({ ...other, game: applyAction(other.game, { type: 'lapAll' }),
+        undo: [{ label: 'جمعی', game: other.game }] }, other.revision),
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    const winner = results.find(result => result.status === 'fulfilled').value;
+    const loser = results.find(result => result.status === 'rejected').reason;
+    assert.equal(loser.code, 'CONFLICT');
+    assert.deepEqual(loser.latest, winner);
+    assert.equal(winner.undo.length, 1);
+    assert.deepEqual(winner.game.cards.slice(2), before.game.cards.slice(2));
+    assert.deepEqual(await second.reload(), winner);
+  } finally { first.close(); second.close(); }
+});
+
+test('the actual shipped schema-3 client rejects retrospective histories and cannot overwrite them', async t => {
+  const shipped = '72ddf935343576be833fd2825d2acf3a0ff9a3f9';
+  let domainSource;
+  let storageSource;
+  try {
+    domainSource = execFileSync('git', ['show', `${shipped}:src/domain.js`], { encoding: 'utf8', windowsHide: true });
+    storageSource = execFileSync('git', ['show', `${shipped}:src/storage.js`], { encoding: 'utf8', windowsHide: true });
+  } catch {
+    t.skip('Shipped schema-3 sources are unavailable in this checkout.');
+    return;
+  }
+  const domainUrl = `data:text/javascript;base64,${Buffer.from(domainSource).toString('base64')}`;
+  const oldDomain = await import(domainUrl);
+  const oldStorage = await import(`data:text/javascript;base64,${Buffer.from(storageSource.replace("'./domain.js'", JSON.stringify(domainUrl))).toString('base64')}`);
+  let oldGame = oldDomain.applyAction(oldDomain.createGame(), { type: 'add', ownerId: 'p1', name: 'قدیمی', price: 200 });
+  for (let lap = 0; lap < 8; lap += 1) oldGame = oldDomain.applyAction(oldGame, { type: 'lap', ownerId: 'p1' });
+  const old = oldStorage.createEnvelope(oldGame);
+  for (const location of ['current', 'undo', 'archive']) {
+    const { store: upgradedClient, options, indexedDB } = setup();
+    const stale = new oldStorage.LedgerStore(options);
+    await rawTransaction(indexedDB, objectStore => objectStore.put(old, CURRENT_KEY), 'readwrite');
+    try {
+      const staleSnapshot = await stale.init();
+      const loaded = await upgradedClient.init();
+      const retro = reapplied(loaded.game);
+      const candidate = { ...loaded,
+        game: location === 'current' ? retro : loaded.game,
+        undo: location === 'undo' ? [{ label: 'دورهای قبلی', game: retro }] : [],
+        archives: location === 'archive' ? [retro] : [],
+      };
+      const updated = await upgradedClient.save(candidate, loaded.revision);
+      const staleChange = { ...staleSnapshot, game: oldDomain.applyAction(staleSnapshot.game, {
+        type: 'rename', ownerId: 'p1', name: 'تب قدیمی',
+      }) };
+      await assert.rejects(stale.save(staleChange, staleSnapshot.revision), error => error.code === 'INVALID_DATA');
+      await assert.rejects(stale.reload(), error => error.code === 'INVALID_DATA');
+      const freshOld = new oldStorage.LedgerStore(options);
+      try {
+        await assert.rejects(freshOld.init(), error => error.code === 'INVALID_DATA');
+        assert.deepEqual(JSON.parse(freshOld.readRaw()), updated);
+        await assert.rejects(freshOld.save(staleChange, staleSnapshot.revision), error => error.code === 'INVALID_DATA');
+      } finally { freshOld.close(); }
+      assert.deepEqual(await rawTransaction(indexedDB, objectStore => objectStore.get(CURRENT_KEY)), updated);
+      assert.deepEqual(await upgradedClient.reload(), updated);
+    } finally { stale.close(); upgradedClient.close(); }
+  }
 });

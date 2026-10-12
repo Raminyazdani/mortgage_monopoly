@@ -148,7 +148,7 @@ export function validateEnvelope(envelope, { allowHistoryGap = false, allowLegac
 function validateFinancialShape(card, schemaVersion) {
   if (!isObject(card)) throw new StorageError('مشخصات یکی از کارت‌ها یا رویدادها معتبر نیست.', 'INVALID_DATA');
   if (schemaVersion === 2) {
-    if (card.accrual !== undefined) {
+    if (card.accrual !== undefined || card.interestStopLap !== undefined) {
       throw new StorageError('سابقهٔ بهره با نسخهٔ قدیمی دفتر سازگار نیست.', 'INVALID_DATA');
     }
     return;
@@ -156,6 +156,10 @@ function validateFinancialShape(card, schemaVersion) {
   if (!Array.isArray(card.accrual) || card.accrual.length > MAX_LAPS
     || !Number.isSafeInteger(card.laps) || card.laps < 0 || card.laps > MAX_LAPS) {
     throw new StorageError('سابقه یا تعداد دور بهره معتبر نیست.', 'INVALID_DATA');
+  }
+  if (card.interestStopLap !== undefined && (!Number.isSafeInteger(card.interestStopLap)
+    || card.interestStopLap < 1 || card.interestStopLap >= card.laps)) {
+    throw new StorageError('دور توقف بهره با تعداد دورهای ثبت‌شده سازگار نیست.', 'INVALID_DATA');
   }
   let laps = 0;
   let previous;

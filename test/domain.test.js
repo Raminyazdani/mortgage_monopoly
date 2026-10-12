@@ -998,3 +998,315 @@ test('the lap bound refuses a collective action atomically instead of silently s
   assert.equal(JSON.stringify(game), before);
   assert.equal(game.cards[1].laps, 0);
 });
+
+test('retrospective rules replace a mixed plan even when the selected settings are unchanged', () => {
+  let game = lap(add(createGame(['رامین'])), 'p1', 2);
+  game = action(game, 'setRules', { rules: { compoundRateBps: 2000 } });
+  game = lap(game);
+  game = action(game, 'setRules', { rules: { mode: 'simple', simpleRateBps: 500 } });
+  game = lap(game);
+  const original = structuredClone(game);
+  assert.equal(calculate(game.cards[0]).debt, 150); // exact 150.2 before retrospective replay
+  const reapplied = action(game, 'reapplyRules', { rules: {} });
+  assert.deepEqual(game, original);
+  assert.equal(reapplied.cards[0].laps, 4);
+  assert.equal(reapplied.cards[0].id, original.cards[0].id);
+  assert.equal(reapplied.cards[0].createdAt, original.cards[0].createdAt);
+  assert.equal(reapplied.cards[0].ownerId, original.cards[0].ownerId);
+  assert.equal(reapplied.cards[0].name, original.cards[0].name);
+  assert.deepEqual(reapplied.cards[0].accrual, [{ mode: 'simple', rateBps: 500, laps: 4 }]);
+  assert.equal(calculate(reapplied.cards[0]).debt, 120);
+  assert.deepEqual(reapplied.cards[0].history.slice(0, -1), original.cards[0].history);
+  const event = reapplied.cards[0].history.at(-1);
+  assert.equal(event.type, 'rulesReapplied');
+  assert.equal(event.before.debt, 150);
+  assert.equal(event.after.debt, 120);
+  assert.deepEqual(event.rulesBefore, original.rules);
+  assert.deepEqual(event.rulesAfter, original.rules);
+  assert.equal(action(reapplied, 'reapplyRules', { rules: {} }), reapplied);
+  assert.equal(calculate(lap(reapplied).cards[0]).debt, 125);
+  assert.deepEqual(roundTrip(reapplied), reapplied);
+});
+
+test('retrospective compound and simple modes replay all earlier laps using their own chosen rate', () => {
+  const original = lap(add(createGame()), 'p1', 3);
+  const compound = action(original, 'reapplyRules', { rules: { compoundRateBps: 2000 } });
+  assert.equal(calculate(compound.cards[0]).debt, 173); // exact 172.8
+  assert.deepEqual(compound.cards[0].accrual, [{ mode: 'compound', rateBps: 2000, laps: 3 }]);
+  const simple = action(compound, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 2000 } });
+  assert.equal(calculate(simple.cards[0]).debt, 160);
+  assert.deepEqual(simple.cards[0].accrual, [{ mode: 'simple', rateBps: 2000, laps: 3 }]);
+  assert.equal(simple.rules.compoundRateBps, 2000);
+  assert.equal(simple.rules.simpleRateBps, 2000);
+  assert.deepEqual(roundTrip(simple), simple);
+});
+
+test('lower retrospective rates reactivate grace, retain eight recorded laps and unblock its owner', () => {
+  let game = lap(add(createGame()), 'p1', 8);
+  game = add(game, 'p1', 300, 'previously blocked');
+  assert.equal(canLap(game, 'p1'), false);
+  const original = structuredClone(game);
+  game = action(game, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 500 } });
+  assert.equal(game.cards[0].status, 'active');
+  assert.equal(game.cards[0].laps, 8);
+  assert.equal(calculate(game.cards[0]).debt, 140);
+  assert.equal(game.cards[0].interestStopLap, undefined);
+  assert.equal(canLap(game, 'p1'), true);
+  assert.equal(game.cards[0].history.at(-1).before.status, 'grace');
+  assert.equal(game.cards[0].history.at(-1).after.status, 'active');
+  assert.deepEqual(game.cards[0].history.slice(0, -1), original.cards[0].history);
+  game = lap(game);
+  assert.deepEqual(game.cards.map((card) => card.laps), [9, 1]);
+  assert.deepEqual(game.cards.map((card) => calculate(card).debt), [145, 158]);
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('higher retrospective rates freeze at the first crossing while retaining eight, twelve and 500 recorded laps', () => {
+  for (const count of [8, 12, MAX_LAPS]) {
+    let game = add(createGame([], { mode: 'compound', compoundRateBps: 0, simpleRateBps: 0, hardcore: false }), 'p1', MAX_PRICE);
+    const card = game.cards[0];
+    card.laps = count;
+    card.accrual = [{ mode: 'compound', rateBps: 0, laps: count }];
+    delete card.history;
+    game = hydrateGameHistory(game);
+    const original = structuredClone(game);
+    game = action(game, 'reapplyRules', { rules: { compoundRateBps: 10000 } });
+    assert.deepEqual(original.cards[0].accrual, [{ mode: 'compound', rateBps: 0, laps: count }]);
+    assert.equal(game.cards[0].laps, count);
+    assert.equal(game.cards[0].interestStopLap, 2);
+    assert.equal(game.cards[0].status, 'grace');
+    assert.equal(calculate(game.cards[0]).debt, MAX_PRICE * 2);
+    assert.deepEqual(game.cards[0].accrual, [{ mode: 'compound', rateBps: 10000, laps: count }]);
+    const event = game.cards[0].history.at(-1);
+    assert.equal(event.after.laps, count);
+    assert.equal(event.after.interestStopLap, 2);
+    assert.equal(event.after.debt, MAX_PRICE * 2);
+    assert.equal(canLap(game, 'p1'), false);
+    assert.equal(lap(game), game);
+    assert.equal(action(game, 'reapplyRules', { rules: {} }), game);
+    assert.deepEqual(roundTrip(game), game);
+    const active = action(game, 'reapplyRules', { rules: { compoundRateBps: 0 } });
+    assert.equal(active.cards[0].laps, count);
+    assert.equal(active.cards[0].interestStopLap, undefined);
+    assert.equal(active.cards[0].status, 'active');
+    assert.equal(calculate(active.cards[0]).debt, 5_000_000_000);
+    assert.equal(Object.hasOwn(active.cards[0], 'interestStopLap'), false);
+    assert.equal(Object.hasOwn(active.cards[0].history.at(-1).after, 'interestStopLap'), false);
+    assert.deepEqual(roundTrip(active), active);
+  }
+});
+
+test('retroactive first crossing uses strict exact equality and omits a redundant last-lap stop marker', () => {
+  const zero = { mode: 'compound', compoundRateBps: 0, simpleRateBps: 0, hardcore: false };
+  const equality = action(lap(add(createGame([], zero)), 'p1', 1), 'reapplyRules', { rules: { compoundRateBps: 10000 } });
+  assert.equal(calculate(equality.cards[0]).debt, 200);
+  assert.equal(equality.cards[0].status, 'active');
+  assert.equal(equality.cards[0].interestStopLap, undefined);
+  assert.equal(calculate(equality.cards[0], equality.model, equality.rules).nextOver, true);
+  const lastCrossing = action(lap(add(createGame([], zero)), 'p1', 2), 'reapplyRules', { rules: { compoundRateBps: 10000 } });
+  assert.equal(lastCrossing.cards[0].status, 'grace');
+  assert.equal(calculate(lastCrossing.cards[0]).debt, 400);
+  assert.equal(lastCrossing.cards[0].interestStopLap, undefined);
+  const simpleEquality = action(lap(add(createGame([], zero)), 'p1', 10), 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 1000 } });
+  assert.equal(simpleEquality.cards[0].status, 'active');
+  assert.equal(calculate(simpleEquality.cards[0]).debt, 200);
+  const simpleCrossing = lap(simpleEquality);
+  assert.equal(simpleCrossing.cards[0].status, 'grace');
+  assert.equal(calculate(simpleCrossing.cards[0]).debt, 210);
+  assert.deepEqual(roundTrip(simpleCrossing), simpleCrossing);
+});
+
+test('retrospective rules keep settled and both auction states byte-for-byte unchanged', () => {
+  let game = lap(add(createGame()), 'p1', 2);
+  game = action(game, 'settle', { cardId: game.cards[0].id });
+  game = lap(add(game, 'p2', 201), 'p2', 8);
+  game = action(game, 'auction', { cardId: game.cards[1].id });
+  game = lap(add(game, 'p3', 300), 'p3', 8);
+  game = action(game, 'auction', { cardId: game.cards[2].id });
+  game = action(game, 'closeAuction', { cardId: game.cards[2].id });
+  game = lap(add(game, 'p4', 150), 'p4', 2);
+  const frozen = JSON.stringify(game.cards.slice(0, 3));
+  const original = structuredClone(game);
+  game = action(game, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 0, hardcore: true } });
+  assert.equal(JSON.stringify(game.cards.slice(0, 3)), frozen);
+  assert.deepEqual(game.cards.slice(0, 3).map((card) => card.status), ['settled', 'auction', 'auction_closed']);
+  assert.equal(calculate(game.cards[3]).debt, 75);
+  assert.equal(game.cards[3].history.at(-1).type, 'rulesReapplied');
+  assert.deepEqual(original.cards.slice(0, 3), game.cards.slice(0, 3));
+  assert.deepEqual(roundTrip(game), game);
+  const allFrozen = { ...original, cards: original.cards.slice(0, 3) };
+  const changed = action(allFrozen, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 1250 } });
+  assert.equal(changed.rules.mode, 'simple');
+  assert.equal(changed.rules.simpleRateBps, 1250);
+  assert.deepEqual(changed.cards, allFrozen.cards);
+  assert.equal(action(changed, 'reapplyRules', { rules: {} }), changed);
+});
+
+test('retrospective rules on empty and zero-lap games update rules without fabricating prior laps', () => {
+  const empty = createGame();
+  assert.equal(action(empty, 'reapplyRules', { rules: {} }), empty);
+  const changed = action(empty, 'reapplyRules', { rules: { compoundRateBps: 1250 } });
+  assert.equal(changed.rules.compoundRateBps, 1250);
+  assert.deepEqual(changed.cards, []);
+  const zero = add(changed);
+  const before = structuredClone(zero);
+  const zeroChanged = action(zero, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 750 } });
+  assert.equal(zeroChanged.cards[0].laps, 0);
+  assert.deepEqual(zeroChanged.cards[0].accrual, []);
+  assert.equal(zeroChanged.cards[0].status, 'active');
+  assert.equal(calculate(zeroChanged.cards[0]).debt, 100);
+  assert.deepEqual(zeroChanged.cards[0].history.at(-1).before, zeroChanged.cards[0].history.at(-1).after);
+  assert.deepEqual(zero, before);
+  assert.deepEqual(roundTrip(zeroChanged), zeroChanged);
+});
+
+test('retrospective odd-price precision does not compound rounded displays and forecast uses live rules', () => {
+  const original = lap(add(createGame(), 'p1', 201), 'p1', 2);
+  let game = action(original, 'reapplyRules', { rules: { compoundRateBps: 1250 } });
+  assert.equal(calculate(game.cards[0]).debt, 127); // exact 127.1953125
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 143); // exact 143.0947265625
+  game = action(game, 'reapplyRules', { rules: { mode: 'simple', simpleRateBps: 333 } });
+  assert.equal(calculate(game.cards[0]).debt, 111); // exact 110.53995
+  assert.equal(game.cards[0].laps, 3);
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, false);
+  game = action(game, 'setRules', { rules: { mode: 'compound', compoundRateBps: 10000 } });
+  assert.equal(calculate(game.cards[0]).debt, 111);
+  assert.equal(calculate(game.cards[0], game.model, game.rules).nextOver, true);
+  game = lap(game);
+  assert.equal(calculate(game.cards[0]).debt, 221);
+  assert.equal(game.cards[0].status, 'grace');
+  assert.deepEqual(roundTrip(game), game);
+});
+
+test('retroactive frozen interest survives edit, transfer, settle and auction transitions', () => {
+  const original = lap(add(createGame(['رامین', 'سارا'])), 'p1', 8);
+  let game = action(original, 'reapplyRules', { rules: { compoundRateBps: 4000 } });
+  assert.equal(game.cards[0].interestStopLap, 3);
+  assert.equal(calculate(game.cards[0]).debt, 274); // exact 274.4
+  const cardId = game.cards[0].id;
+  game = action(game, 'editCard', { cardId, name: 'اصلاح شده', price: 201 });
+  assert.equal(game.cards[0].laps, 8);
+  assert.equal(game.cards[0].interestStopLap, 3);
+  assert.equal(calculate(game.cards[0]).debt, 276); // exact 275.772
+  game = action(game, 'transfer', { cardId, ownerId: 'p2' });
+  assert.equal(game.cards[0].interestStopLap, 3);
+  const transferred = structuredClone(game);
+  game = action(game, 'settle', { cardId });
+  assert.equal(game.cards[0].settlement.amount, 276);
+  assert.equal(game.cards[0].settlement.ownerId, 'p2');
+  assert.equal(game.cards[0].interestStopLap, 3);
+  assert.deepEqual(roundTrip(game), game);
+  const paid = structuredClone(game.cards[0]);
+  const changed = action(game, 'reapplyRules', { rules: { compoundRateBps: 0 } });
+  assert.deepEqual(changed.cards[0], paid);
+  const auction = action(transferred, 'auction', { cardId });
+  const closed = action(auction, 'closeAuction', { cardId });
+  assert.equal(closed.cards[0].interestStopLap, 3);
+  assert.equal(calculate(closed.cards[0]).debt, 276);
+  assert.equal(closed.cards[0].history.at(-1).after.interestStopLap, 3);
+  assert.deepEqual(roundTrip(closed), closed);
+});
+
+test('undo snapshots restore exact debt, rules, status, plans, and remove retrospective events and markers together', () => {
+  const original = lap(add(createGame()), 'p1', 8);
+  const undo = structuredClone(original);
+  const changed = action(original, 'reapplyRules', { rules: { compoundRateBps: 10000, hardcore: true } });
+  assert.equal(changed.cards[0].interestStopLap, 2);
+  assert.equal(changed.cards[0].history.at(-1).type, 'rulesReapplied');
+  const restored = roundTrip(undo);
+  assert.deepEqual(restored, original);
+  assert.equal(restored.cards[0].interestStopLap, undefined);
+  assert.equal(restored.cards[0].laps, 8);
+  assert.equal(calculate(restored.cards[0]).debt, 214);
+  assert.equal(restored.rules.compoundRateBps, 1000);
+  assert.equal(restored.rules.hardcore, false);
+});
+
+test('forged stop markers reject invalid bounds, active stops and non-first crossings before calculation', () => {
+  const original = action(lap(add(createGame()), 'p1', 8), 'reapplyRules', { rules: { compoundRateBps: 4000 } });
+  const reject = (mutate) => {
+    const game = structuredClone(original);
+    mutate(game.cards[0]);
+    const before = JSON.stringify(game);
+    assert.throws(() => validateGame(game));
+    assert.equal(JSON.stringify(game), before);
+  };
+  for (const stop of [null, 0, -1, 1.5, '3', 8, 9, 1_000_000]) {
+    reject((card) => { card.interestStopLap = stop; });
+    const card = { price: 200, laps: 8, accrual: [{ mode: 'compound', rateBps: 4000, laps: 8 }], interestStopLap: stop };
+    assert.throws(() => calculate(card));
+  }
+  reject((card) => { card.status = 'active'; });
+  reject((card) => { card.interestStopLap = 2; }); // no crossing yet
+  reject((card) => { card.interestStopLap = 4; }); // previous lap already crossed
+  reject((card) => { delete card.interestStopLap; });
+  reject((card) => { card.history.at(-1).after.interestStopLap = 4; });
+  reject((card) => { card.history[0].after.interestStopLap = 1; });
+});
+
+test('fabricated retrospective events cannot change laps, identity, money history or select a different interest plan', () => {
+  const original = action(lap(add(createGame()), 'p1', 8), 'reapplyRules', { rules: { compoundRateBps: 4000 } });
+  const reject = (mutate) => {
+    const game = structuredClone(original);
+    mutate(game);
+    assert.throws(() => validateGame(game));
+  };
+  reject((game) => { delete game.cards[0].history.at(-1).rulesAfter; });
+  reject((game) => { game.cards[0].history.at(-1).rulesBefore.mode = 'flat'; });
+  reject((game) => { game.cards[0].history.at(-1).rulesAfter.compoundRateBps = 5000; });
+  reject((game) => { game.cards[0].history.at(-1).after.laps = 7; });
+  reject((game) => { game.cards[0].history.at(-1).after.ownerId = 'p2'; });
+  reject((game) => { game.cards[0].history.at(-1).after.name = 'fabricated edit'; });
+  reject((game) => { game.cards[0].history.at(-1).after.price = 201; });
+  reject((game) => { game.cards[0].history.at(-1).after.debt = 275; });
+  reject((game) => { game.cards[0].history.at(-1).after.paid = 274; });
+  reject((game) => { game.cards[0].history.at(-1).type = 'rulesChanged'; });
+  const noop = lap(add(createGame()), 'p1', 2);
+  const last = noop.cards[0].history.at(-1);
+  noop.cards[0].history.push({ id: 'forged-noop', type: 'rulesReapplied', at: last.at,
+    before: structuredClone(last.after), after: structuredClone(last.after), rulesBefore: noop.rules, rulesAfter: noop.rules });
+  assert.throws(() => validateGame(noop));
+  const settled = action(original, 'settle', { cardId: original.cards[0].id });
+  const frozenLast = settled.cards[0].history.at(-1);
+  settled.cards[0].history.push({ id: 'forged-frozen-replay', type: 'rulesReapplied', at: frozenLast.at,
+    before: structuredClone(frozenLast.after), after: structuredClone(frozenLast.after),
+    rulesBefore: settled.rules, rulesAfter: { ...settled.rules, hardcore: true } });
+  assert.throws(() => validateGame(settled));
+});
+
+test('normal history events cannot silently add, remove or move a retrospective stop marker', () => {
+  const original = action(lap(add(createGame()), 'p1', 8), 'reapplyRules', { rules: { compoundRateBps: 4000 } });
+  const cardId = original.cards[0].id;
+  for (const [type, extra] of [
+    ['transfer', { cardId, ownerId: 'p2' }], ['settle', { cardId }], ['auction', { cardId }],
+    ['editCard', { cardId, name: 'اصلاح', price: 300 }],
+  ]) {
+    const changed = action(original, type, extra);
+    delete changed.cards[0].history.at(-1).after.interestStopLap;
+    assert.throws(() => validateGame(changed), undefined, type);
+  }
+  const closed = action(action(original, 'auction', { cardId }), 'closeAuction', { cardId });
+  delete closed.cards[0].history.at(-1).after.interestStopLap;
+  assert.throws(() => validateGame(closed));
+});
+
+test('capacity failures and invalid retrospective settings leave every source card and rule unchanged', () => {
+  const original = add(add(createGame()), 'p2', 200, 'full');
+  const full = original.cards[1];
+  for (let index = 1; index < MAX_CARD_HISTORY; index += 1) {
+    const before = structuredClone(full.history.at(-1).after);
+    const after = { ...before, name: `full-${index}` };
+    full.history.push({ id: `retro-edit-${index}`, type: 'editCard', at: full.createdAt, before, after });
+    full.name = after.name;
+  }
+  assert.equal(validateGame(original), original);
+  const before = JSON.stringify(original);
+  assert.throws(() => action(original, 'reapplyRules', { rules: { compoundRateBps: 2000 } }), /۵۰۰/);
+  assert.equal(action(original, 'reapplyRules', { rules: {} }), original);
+  for (const rules of [null, [], { mode: 'flat' }, { compoundRateBps: 10001 },
+    { simpleRateBps: -1 }, { hardcore: 1 }, { unknown: 0 }]) {
+    assert.throws(() => action(original, 'reapplyRules', { rules }));
+  }
+  assert.equal(JSON.stringify(original), before);
+});

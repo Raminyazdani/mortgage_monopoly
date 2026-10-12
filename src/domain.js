@@ -9,8 +9,8 @@ const MAX_SETTLEMENT = MAX_PRICE * 2;
 const MODELS = new Set(['compound', 'legacy-simple']);
 const INTEREST_MODES = new Set(['compound', 'simple']);
 const STATUSES = new Set(['active', 'grace', 'auction', 'settled', 'auction_closed']);
-const EVENT_TYPES = new Set(['baseline', 'created', 'lap', 'lapAll', 'rulesChanged', 'transfer', 'settle', 'auction', 'closeAuction', 'editCard']);
-const SNAPSHOT_FIELDS = ['name', 'price', 'laps', 'accrual', 'ownerId', 'status', 'debt', 'paid'];
+const EVENT_TYPES = new Set(['baseline', 'created', 'lap', 'lapAll', 'rulesChanged', 'rulesReapplied', 'transfer', 'settle', 'auction', 'closeAuction', 'editCard']);
+const SNAPSHOT_FIELDS = ['name', 'price', 'laps', 'accrual', 'interestStopLap', 'ownerId', 'status', 'debt', 'paid'];
 const RULE_FIELDS = ['mode', 'compoundRateBps', 'simpleRateBps', 'hardcore'];
 const OWNER_IDS = Array.from({ length: 8 }, (_, i) => `p${i + 1}`);
 const FA_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
@@ -86,11 +86,16 @@ function validatePlan(card) {
   }
   if (laps !== card.laps) fail('سابقهٔ بهره با تعداد دور کارت سازگار نیست.');
 }
+function validateInterestStop(card) {
+  if (card.interestStopLap !== undefined && (!integer(card.interestStopLap, 1, card.laps - 1)
+    || card.status === 'active')) fail('دور توقف بهرهٔ کارت معتبر نیست.');
+}
 
 function validateCalculationBounds(card, model) {
   if (!MODELS.has(model) || !object(card) || !integer(card.price, 1, MAX_PRICE)
     || !integer(card.laps, 0, MAX_LAPS)) fail('دادهٔ محاسبهٔ بدهی معتبر نیست.');
   validatePlan(card);
+  validateInterestStop(card);
 }
 
 function gcd(a, b) {
@@ -111,7 +116,7 @@ function increment(exact, price, mode, rateBps, laps) {
   return reduced(exact.numerator * 20000n + BigInt(price) * rate * count * exact.denominator,
     exact.denominator * 20000n);
 }
-function fraction(card, model, limit = card.laps) {
+function fraction(card, model, limit = card.interestStopLap ?? card.laps) {
   let exact = { numerator: BigInt(card.price), denominator: 2n };
   let remaining = limit;
   for (const segment of plan(card, model)) {
@@ -148,13 +153,15 @@ export function createGame(names = [], rules = defaults()) {
     players: OWNER_IDS.map((ownerId, index) => ({ id: ownerId, name: names[index] ?? '' })), cards: [] });
 }
 function cardSnapshot(card, game) {
-  return { name: card.name, price: card.price, laps: card.laps, accrual: clone(plan(card, game.model)), ownerId: card.ownerId,
+  return { name: card.name, price: card.price, laps: card.laps, accrual: clone(plan(card, game.model)),
+    ...(card.interestStopLap === undefined ? {} : { interestStopLap: card.interestStopLap }), ownerId: card.ownerId,
     ownerName: game.players[OWNER_IDS.indexOf(card.ownerId)].name, status: card.status,
     debt: calculate(card, game.model, game.rules).debt, paid: card.status === 'settled' ? card.settlement.amount : null };
 }
 function sameSnapshot(left, right, fields = SNAPSHOT_FIELDS, model = 'compound') {
   return fields.every((field) => field === 'accrual'
-    ? samePlan(plan(left, model), plan(right, model)) : left[field] === right[field]);
+    ? samePlan(plan(left, model), plan(right, model)) : field === 'interestStopLap'
+      ? (left[field] ?? null) === (right[field] ?? null) : left[field] === right[field]);
 }
 function samePlan(left, right) {
   return left.length === right.length && left.every((segment, index) => segment.mode === right[index].mode
@@ -171,6 +178,7 @@ function validateSnapshotBounds(snapshot) {
     fail('مشخصات یکی از رویدادهای کارت معتبر نیست.');
   }
   validatePlan(snapshot);
+  validateInterestStop(snapshot);
 }
 function validateHistoryBounds(history) {
   if (!Array.isArray(history) || history.length < 1 || history.length > MAX_CARD_HISTORY) fail('تاریخچهٔ کارت باید بین ۱ و ۵۰۰ رویداد داشته باشد.');
@@ -196,19 +204,21 @@ function validateHistoryBounds(history) {
           || (OWNER_IDS.includes(event.triggerOwnerId) && validText(event.triggerOwnerName, 80)))) fail('بازیکن آغازکنندهٔ دور معتبر نیست.');
       }
     }
-    if (event.type === 'rulesChanged') {
+    if (['rulesChanged', 'rulesReapplied'].includes(event.type)) {
       validateRules(event.rulesBefore);
       validateRules(event.rulesAfter);
-      if (sameRules(event.rulesBefore, event.rulesAfter)) fail('تغییر قواعد رویداد خالی است.');
+      if (event.type === 'rulesChanged' && sameRules(event.rulesBefore, event.rulesAfter)) fail('تغییر قواعد رویداد خالی است.');
     }
   }
 }
 function validateStateRules(card, model) {
   const exact = fraction(card, model);
   const isOver = over(card.price, exact);
-  // Nonnegative rates make debt monotone: the last-lap prefix determines
-  // whether this was the first crossing, for any combination of rule segments.
-  if (card.laps > 0 && over(card.price, fraction(card, model, card.laps - 1))) fail('دور مؤثر کارت از اولین عبور از سقف بیشتر است.');
+  // Retrospective rules can reach the ceiling before the recorded last lap.
+  // Preserve the lap record, but freeze interest at its first exact crossing.
+  const effectiveLaps = card.interestStopLap ?? card.laps;
+  if (effectiveLaps > 0 && over(card.price, fraction(card, model, effectiveLaps - 1))) fail('دور مؤثر کارت از اولین عبور از سقف بیشتر است.');
+  if (card.interestStopLap !== undefined && !isOver) fail('توقف بهره باید در اولین عبور دقیق از سقف باشد.');
   if (card.status === 'active' && isOver) fail('کارت فعال نمی‌تواند از سقف بدهی گذشته باشد.');
   if (['grace', 'auction', 'auction_closed'].includes(card.status) && !isOver) fail('آخرین شانس و مزایده باید در اولین عبور دقیق از سقف ثابت باشند.');
   return { debt: halfUp(exact.numerator, exact.denominator) };
@@ -220,6 +230,20 @@ function advancedPlan(card, model, rule) {
   else next.push({ ...rule, laps: 1 });
   return next;
 }
+function reappliedState(card, model, rules) {
+  const rule = interestRule(rules);
+  const accrual = card.laps ? [{ ...rule, laps: card.laps }] : [];
+  const repriced = { price: card.price, laps: card.laps, accrual };
+  if (!over(card.price, fraction(repriced, model))) return { accrual, status: 'active' };
+  let first = 1;
+  let last = card.laps;
+  while (first < last) {
+    const middle = Math.floor((first + last) / 2);
+    if (over(card.price, fraction(repriced, model, middle))) last = middle;
+    else first = middle + 1;
+  }
+  return { accrual, status: 'grace', ...(first < card.laps ? { interestStopLap: first } : {}) };
+}
 function validateHistory(card, game, allowHistoryGap) {
   if (card.history === undefined) return;
   let previous;
@@ -230,7 +254,7 @@ function validateHistory(card, game, allowHistoryGap) {
     }
     if (previous && type !== 'baseline' && !sameSnapshot(previous, before, SNAPSHOT_FIELDS, game.model)) fail('رویدادهای کارت به ترتیب به هم متصل نیستند.');
     const unchanged = (fields) => sameSnapshot(before, after, fields, game.model);
-    const facts = ['name', 'price', 'laps', 'accrual', 'ownerId', 'ownerName'];
+    const facts = ['name', 'price', 'laps', 'accrual', 'interestStopLap', 'ownerId', 'ownerName'];
     let valid = true;
     switch (type) {
       case 'baseline': break;
@@ -239,19 +263,28 @@ function validateHistory(card, game, allowHistoryGap) {
       case 'lapAll': {
         const rule = event.interest ?? interestRule(defaults(game.model));
         valid = before.status === 'active' && ['active', 'grace'].includes(after.status)
-          && after.laps === before.laps + 1 && unchanged(['name', 'price', 'ownerId', 'ownerName', 'paid'])
+          && after.laps === before.laps + 1 && unchanged(['name', 'price', 'interestStopLap', 'ownerId', 'ownerName', 'paid'])
           && samePlan(plan(after, game.model), advancedPlan(before, game.model, rule));
         break;
       }
       case 'rulesChanged': valid = before.status === 'active' && unchanged([...SNAPSHOT_FIELDS, 'ownerName']); break;
+      case 'rulesReapplied': {
+        const expected = reappliedState(before, game.model, event.rulesAfter);
+        valid = ['active', 'grace'].includes(before.status)
+          && unchanged(['name', 'price', 'laps', 'ownerId', 'ownerName', 'paid'])
+          && samePlan(plan(after, game.model), expected.accrual) && after.status === expected.status
+          && (after.interestStopLap ?? null) === (expected.interestStopLap ?? null)
+          && (!sameRules(event.rulesBefore, event.rulesAfter) || !unchanged(SNAPSHOT_FIELDS));
+        break;
+      }
       case 'transfer': valid = ['active', 'grace'].includes(before.status) && before.ownerId !== after.ownerId
-        && unchanged(['name', 'price', 'laps', 'accrual', 'status', 'debt', 'paid']); break;
+        && unchanged(['name', 'price', 'laps', 'accrual', 'interestStopLap', 'status', 'debt', 'paid']); break;
       case 'settle': valid = ['active', 'grace'].includes(before.status) && after.status === 'settled'
         && after.paid === before.debt && unchanged([...facts, 'debt']); break;
       case 'auction': valid = before.status === 'grace' && after.status === 'auction' && unchanged([...facts, 'debt', 'paid']); break;
       case 'closeAuction': valid = before.status === 'auction' && after.status === 'auction_closed' && unchanged([...facts, 'debt', 'paid']); break;
       case 'editCard': valid = (before.name !== after.name || before.price !== after.price)
-        && unchanged(['laps', 'accrual', 'ownerId', 'ownerName', 'status', 'paid']); break;
+        && unchanged(['laps', 'accrual', 'interestStopLap', 'ownerId', 'ownerName', 'status', 'paid']); break;
       default: valid = false;
     }
     if (!valid) fail('تغییر ثبت‌شده با نوع رویداد کارت سازگار نیست.');
@@ -308,6 +341,7 @@ export function validateGameBounds(game) {
     if (!validText(card.name, 120)) fail('نام کارت باید حداکثر ۱۲۰ نویسه باشد.');
     if (!integer(card.price, 1, MAX_PRICE) || !integer(card.laps, 0, MAX_LAPS)) fail('قیمت یا تعداد دور کارت خارج از محدوده است.');
     validatePlan(card);
+    validateInterestStop(card);
     if (!STATUSES.has(card.status) || !validDate(card.createdAt)) fail('وضعیت یا زمان کارت معتبر نیست.');
     if (card.legacy !== undefined && (!object(card.legacy) || !integer(card.legacy.rawLaps, 0, MAX_RAW_LAPS))) fail('تعداد دور تاریخی کارت معتبر نیست.');
     if (card.status === 'settled') {
@@ -366,6 +400,40 @@ export function applyAction(game, action) {
       for (const current of updated.cards) {
         if (current.status === 'active') appendEvent(current, updated, 'rulesChanged', cardSnapshot(current, updated), at,
           { rulesBefore: beforeRules, rulesAfter: afterRules });
+      }
+      break;
+    }
+    case 'reapplyRules': {
+      if (!object(action.rules) || Object.keys(action.rules).some((key) => !RULE_FIELDS.includes(key))) fail('تنظیم بهره معتبر نیست.');
+      const beforeRules = game.rules ?? defaults(game.model);
+      const afterRules = validateRules({ ...beforeRules, ...action.rules });
+      const rulesChanged = !sameRules(beforeRules, afterRules);
+      // Validate all cards and snapshots before the first recalculation.
+      validateGame(game);
+      const changes = new Map();
+      for (const current of game.cards) {
+        if (!['active', 'grace'].includes(current.status)) continue;
+        const state = reappliedState(current, game.model, afterRules);
+        const changed = current.status !== state.status
+          || !samePlan(plan(current, game.model), state.accrual)
+          || (current.interestStopLap ?? null) !== (state.interestStopLap ?? null);
+        if (rulesChanged || changed) {
+          if ((current.history?.length ?? 0) >= MAX_CARD_HISTORY) fail('تاریخچهٔ این کارت به سقف ۵۰۰ رویداد رسیده است؛ تغییر ثبت نشد.');
+          changes.set(current.id, state);
+        }
+      }
+      if (!rulesChanged && !changes.size) return game;
+      updated = prepare();
+      updated.rules = clone(afterRules);
+      for (const current of updated.cards) {
+        const state = changes.get(current.id);
+        if (!state) continue;
+        const before = cardSnapshot(current, updated);
+        current.accrual = clone(state.accrual);
+        current.status = state.status;
+        if (state.interestStopLap === undefined) delete current.interestStopLap;
+        else current.interestStopLap = state.interestStopLap;
+        appendEvent(current, updated, 'rulesReapplied', before, at, { rulesBefore: beforeRules, rulesAfter: afterRules });
       }
       break;
     }
