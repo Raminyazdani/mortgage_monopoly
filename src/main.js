@@ -222,7 +222,7 @@ $('archive-list').addEventListener('click',event=>{
   if(button.dataset.exportGame!==undefined){const game=envelope.archives[Number(button.dataset.exportGame)];download(exportEnvelope(createEnvelope(game)),`mortgage-archive-${game.id}.json`);}
   if(button.dataset.restoreGame!==undefined){const game=envelope.archives[Number(button.dataset.restoreGame)];confirm('بازگرداندن بازی بایگانی‌شده',`${fa(game.cards.length)} کارت بازیابی می‌شود؛ دفتر فعلی هم بایگانی خواهد شد.`,()=>replaceGame(createEnvelope(clone(game))),'بازگردان');}
 });
-window.addEventListener('beforeunload',event=>{if(dirty||failure){event.preventDefault();event.returnValue='';}});
+window.addEventListener('beforeunload',event=>{if(dirty||failure||drainPromise){event.preventDefault();event.returnValue='';}});
 $('build-id').textContent=`نسخه ۱ · ${__BUILD_ID__}`;
 try{envelope=await store.init();persistedRevision=envelope.revision;render();setStorage();}
 catch(error){failure=error;loadFailure=true;message(`دفتر باز نشد. ${error.message} دادهٔ قبلی جایگزین نشده؛ خروجی بازیابی بگیر یا فایل سالم را بازیابی کن.`,true);setStorage();}

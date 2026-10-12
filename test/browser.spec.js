@@ -475,6 +475,37 @@ test('explicit reload locks edits until its asynchronous read has completed', as
   await second.close();
 });
 
+test('closing during pending save warns and dismissal retains the committed lap', async ({ page }) => {
+  await open(page);
+  const id = await addCard(page, 'p1', 'ذخیره هنگام بستن صفحه');
+  await page.evaluate(() => {
+    const descriptor = Object.getOwnPropertyDescriptor(IDBTransaction.prototype, 'oncomplete');
+    Object.defineProperty(IDBTransaction.prototype, 'oncomplete', {
+      ...descriptor,
+      set(callback) {
+        const transaction = this;
+        descriptor.set.call(transaction, transaction.mode === 'readwrite' && typeof callback === 'function'
+          ? (event) => { window.releaseSaveCompletion = () => callback.call(transaction, event); }
+          : callback);
+      },
+    });
+  });
+  await page.locator('[data-lap="p1"]').click();
+  await page.waitForFunction(() => typeof window.releaseSaveCompletion === 'function');
+  await expect(page.locator('#storage-status')).toContainText('در حال ذخیره');
+  const dialogEvent = page.waitForEvent('dialog', { timeout: 5_000 });
+  const navigation = page.evaluate(() => location.reload()).catch(() => null);
+  const dialog = await dialogEvent;
+  expect(dialog.type()).toBe('beforeunload');
+  await dialog.dismiss();
+  await navigation;
+  await page.evaluate(() => window.releaseSaveCompletion());
+  await expect(page.locator('[data-lap="p1"]')).toBeEnabled();
+  await persisted(page, (data) => data.game.cards.find((item) => item.id === id).laps === 1);
+  await page.reload();
+  await debt(page, id, 110);
+});
+
 test('a fresh browser context gets an independent ledger at the same public URL', async ({ page, browser }) => {
   await open(page);
   await rename(page, 'p1', 'فقط دفتر اول');
